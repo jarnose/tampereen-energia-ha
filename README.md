@@ -1,5 +1,7 @@
 # Tampereen Energia - Home Assistant Integration
 
+## NOTE! A lot of Ai has been used to make this!
+
 This project provides a two-part solution for integrating your **Tampereen Energia** electricity consumption data into **Home Assistant**:
 1. **History Importer**: A one-time script to backfill years of daily history into the HA Energy Dashboard.
 Python-based tool to scrape historical electricity consumption data from the Tampereen Energia customer portal and inject it directly into the Home Assistant long-term statistics database.
@@ -40,6 +42,7 @@ source venv/bin/activate
 pip install playwright websockets python-dateutil
 playwright install chromium
 playwright install-deps
+```
 
 ### 2. Configure & Run
 
@@ -47,6 +50,7 @@ Open import_history_v2.py and set your credentials, HA_TOKEN, and the desired ST
 
 ```bash
 python import_history_v2.py
+```
 
 ### 3. Add to Energy Dashboard
 
@@ -67,6 +71,7 @@ Update the environment section in docker-compose.yml with your:
 
 ```bash
 docker-compose up -d
+```
 
 ### 3. Dashboard Visualization
 
@@ -86,6 +91,7 @@ series:
         date.setHours(index);
         return [date.getTime(), value];
       });
+```
 
 ## 📦 Dependencies
 
@@ -97,6 +103,7 @@ paho-mqtt
 schedule
 websockets
 python-dateutil
+```
 
 ## 📜 License
 
