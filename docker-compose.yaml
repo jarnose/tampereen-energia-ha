@@ -1,0 +1,20 @@
+services:
+  tampere_energy_scraper:
+    build: .
+    container_name: tampere_energy
+    restart: unless-stopped
+    environment:
+      # Timezone ensures the schedule runs at 08:15 Finnish time, not UTC
+      - TZ=Europe/Helsinki 
+      - RUN_TIME=6:15
+      
+      # Tampereen Energia Credentials
+      - TE_USERNAME=
+      - TE_PASSWORD=
+      - TE_METERINGPOINT=
+      
+      # Home Assistant MQTT Broker
+      - MQTT_BROKER=192.168.X.X
+      - MQTT_PORT=1883
+      - MQTT_USER=
+      - MQTT_PASS=
