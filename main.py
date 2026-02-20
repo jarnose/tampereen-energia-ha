@@ -6,10 +6,10 @@ import schedule
 from datetime import datetime, timedelta, timezone
 from dateutil import tz
 from playwright.sync_api import sync_playwright
-from websockets.sync.client import connect  # NEW: Synchronous import
+from websockets.sync.client import connect
 
 # --- LOGGING SETUP ---
-log_dir = "/app/logs"
+log_dir = "/app/data"
 log_file = os.path.join(log_dir, "scraper.log")
 if not os.path.exists(log_dir): os.makedirs(log_dir)
 
@@ -42,15 +42,26 @@ def send_to_ha(extracted_data):
 
     sum_file = "/app/data/ha_sync.json"
     running_sum = 0.0
+    last_pushed_date = ""
+
+    # Load existing sum AND the last pushed date
     if os.path.exists(sum_file):
         try:
             with open(sum_file, "r") as f:
-                running_sum = json.load(f).get("running_sum", 0.0)
+                sync_data = json.load(f)
+                running_sum = sync_data.get("running_sum", 0.0)
+                last_pushed_date = sync_data.get("last_pushed_date", "")
         except: pass
+
+    # Prevent duplicate pushing on container restart
+    current_data_date = extracted_data["date"]
+    if current_data_date == last_pushed_date:
+        logging.info(f"Data for {current_data_date} already sent to HA. Skipping push to prevent negative spikes.")
+        return
 
     stats = []
     local_tz = tz.gettz("Europe/Helsinki")
-    base_time = datetime.strptime(extracted_data["date"], "%Y-%m-%d").replace(tzinfo=local_tz)
+    base_time = datetime.strptime(current_data_date, "%Y-%m-%d").replace(tzinfo=local_tz)
 
     for i, val in enumerate(extracted_data["hourly_data"]):
         running_sum += float(val)
@@ -76,7 +87,6 @@ def send_to_ha(extracted_data):
     }
 
     try:
-        # Use synchronous 'connect' instead of 'async with'
         with connect(HA_URL) as ws:
             ws.recv() # Wait for auth_required
             ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
@@ -91,8 +101,12 @@ def send_to_ha(extracted_data):
             
             if res.get("success"):
                 logging.info(f"Successfully injected {len(stats)} hours into Home Assistant!")
+                # Save both the new sum AND the date we just pushed
                 with open(sum_file, "w") as f:
-                    json.dump({"running_sum": running_sum}, f)
+                    json.dump({
+                        "running_sum": running_sum,
+                        "last_pushed_date": current_data_date
+                    }, f)
             else:
                 logging.error(f"HA Import failed: {res}")
                 
@@ -185,7 +199,7 @@ def fetch_and_publish():
                             "date": start_str[:10],
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         }
-                        logging.info(f"Success! Fetched {len(hourly_values)} hourly points.")
+                        logging.info(f"Success! Fetched {len(hourly_values)} hourly points for {start_str[:10]}.")
         except Exception as e:
             logging.error(f"Scraper error: {e}")
         
@@ -193,17 +207,22 @@ def fetch_and_publish():
 
         # --- PROCESS DATA ---
         if extracted_data:
-            # 1. Save to local JSON
+            # 1. Save to local JSON history
             history_file = "/app/data/history.json"
             all_history = []
             if os.path.exists(history_file):
                 try:
                     with open(history_file, 'r') as f: all_history = json.load(f)
                 except: pass
-            all_history.append(extracted_data)
-            unique_history = {item['date']: item for item in all_history}.values()
-            with open(history_file, 'w') as f:
-                json.dump(list(unique_history), f, indent=4)
+            
+            # Prevent duplicate entries in local history file too
+            if not any(entry['date'] == extracted_data['date'] for entry in all_history):
+                all_history.append(extracted_data)
+                # Sort by date to keep it clean
+                all_history = sorted(all_history, key=lambda x: x['date'])
+                with open(history_file, 'w') as f:
+                    json.dump(all_history, f, indent=4)
+                logging.info(f"Saved {extracted_data['date']} to local history.json")
             
             # 2. Push to HA via Synchronous WebSocket
             send_to_ha(extracted_data)
