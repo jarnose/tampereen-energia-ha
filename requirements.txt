@@ -1,5 +1,4 @@
-playwright==1.41.0
-paho-mqtt==1.6.1
-schedule==1.2.1
+playwright==1.58.0
+schedule
 websockets
 python-dateutil

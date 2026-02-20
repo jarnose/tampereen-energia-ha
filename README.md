@@ -105,6 +105,13 @@ websockets
 python-dateutil
 ```
 
+## 💾 Local Data Access
+The Docker container maintains a local JSON backup on the host machine:
+* **Logs**: `./logs/scraper.log`
+* **Historical Data**: `./data/history.json`
+
+This data is persisted even if the container is rebuilt or deleted.
+
 ## 📜 License
 
 Personal use only. Not affiliated with Tampereen Energia Oy.

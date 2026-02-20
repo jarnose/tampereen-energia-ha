@@ -1,15 +1,18 @@
 # Use the official Playwright image with dependencies pre-installed
-FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
-# Set the working directory
+# Set the working directory inside the container
 WORKDIR /app
 
-# Copy requirements and install them
+# Create a directory for logs
+RUN mkdir -p /app/logs
+
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the python script
+# Copy the scraper script
 COPY main.py .
 
-# Run the python script
-CMD ["python", "main.py"]
+# Run the script
+CMD ["python", "-u", "main.py"]
