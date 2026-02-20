@@ -82,7 +82,15 @@ docker-compose up -d
 
 ### 3. Dashboard Visualization
 
-The daily scraper updates the data so you can view it in you Energy-dashboard. Just add the tampereen_energia:imported_history to your energy-dashboard.
+How to add it to your Energy Dashboard:
+
+    * In Home Assistant, go to Settings > Dashboards > Energy.
+
+    * Under Electricity grid, click Add consumption.
+
+    * In the dropdown, search for Tampereen Energia History (or type tampereen_energia:imported_history).
+
+    * Save it.
 
 ## 📦 Dependencies
 
