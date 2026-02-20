@@ -1,116 +1,99 @@
-# Tampereen Energia - Home Assistant Integration
+# Tampereen Energia to Home Assistant Scraper
 
-## NOTE! A lot of Ai has been used to make this!
+An automated Python scraper that runs in a Docker container to fetch hourly electricity consumption data from the Tampereen Energia web portal. Because the utility does not provide an official API, this script uses Playwright to log in, navigate the Single Page Application (SPA), intercept the internal data requests, and replay them to fetch historical data.
 
-This project provides a two-part solution for integrating your **Tampereen Energia** electricity consumption data into **Home Assistant**:
-1. **History Importer**: A one-time script to backfill years of daily history into the HA Energy Dashboard.
-Python-based tool to scrape historical electricity consumption data from the Tampereen Energia customer portal and inject it directly into the Home Assistant long-term statistics database.
-
-Unlike standard sensors, this script uses the Home Assistant WebSocket API to "backfill" data, allowing you to see years of history in your Energy Dashboard instantly.
-Features:
-- Granular Data: Fetches daily consumption totals for any custom date range.
-- Smart Meter Sync: Uses Playwright to navigate the OutSystems-based portal and bypasses anti-forgery tokens (CSRF).
-- Direct Injection: Uses recorder/import_statistics via WebSockets to ensure data is permanent and visible in the Energy Dashboard.
-- Configurable: Easily adjust start/end dates, metering points, and credentials.
-
-2. **Daily Scraper (Docker)**: A containerized background service that fetches hourly data every morning and sends it to HA via MQTT.
+The extracted 24-hour data points are saved to a local JSON backup and injected directly into Home Assistant's Long-Term Statistics database via WebSocket.
 
 ---
 
-## 🛠 Prerequisites
-
-* **Linux/Debian Host:** (Tested on Debian).
-* **Python 3.9+** (For the history importer).
-* **Docker & Docker Compose** (For the daily scraper).
-* **Home Assistant:**
-  * [Long-Lived Access Token](https://www.home-assistant.io/docs/authentication/#long-lived-access-token).
+## 🚀 Features
+* **Headless Browser Automation:** Uses Playwright to navigate the OutSystems-based portal.
+* **Network Interception:** Captures API headers and replays requests cleanly.
+* **Direct HA Integration:** Pushes data into Home Assistant's native statistics engine via WebSocket (no custom sensors or MQTT required).
+* **Local Persistence:** Maintains a running sum (`ha_sync.json`) and an offline history backup (`history.json`).
+* **Robust Scheduling:** Uses the `schedule` library to run automatically every day at a specified time.
 
 ---
 
-## 📅 Part 1: History Importer
+## 📁 Directory Structure
+Ensure your project directory looks like this:
 
-Use this to populate your Energy Dashboard with data from previous years.
+```text
+/opt/tampere_energy/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── main.py
+├── data/           # Host-mapped volume (contains history.json and ha_sync.json)
+├── logs/           # Host-mapped volume (scraper.log)
+```
 
-### 1. Setup Environment
+**Crucial Permission Note:** Docker runs the Python script internally, but it needs permission to write to your host machine's `data` folder. Before running for the first time, ensure the folder exists and is writable:
 
 ```bash
-git clone https://github.com/jarnose/tampereen-energia-ha.git
-cd tampereen-energia-ha
-python3 -m venv venv
-source venv/bin/activate
-pip install playwright websockets python-dateutil
-playwright install chromium
-playwright install-deps
+mkdir -p data logs
+sudo chmod -R 777 data logs
 ```
 
-### 2. Configure & Run
+---
 
-Open import_history_v2.py and set your credentials, HA_TOKEN, and the desired START_DATE / END_DATE.
+## ⚙️ Configuration
+
+All configuration is handled via environment variables in your `docker-compose.yml` file:
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `TE_USERNAME` | Tampereen Energia login email | `user@example.com` |
+| `TE_PASSWORD` | Tampereen Energia password | `MySecurePassword` |
+| `TE_METERINGPOINT` | Your specific meter ID | `TSV_FI_TKS000_6258986` |
+| `HA_URL` | Home Assistant WebSocket URL | `ws://192.168.1.100:8123/api/websocket` |
+| `HA_TOKEN` | Long-Lived Access Token from HA | `eyJhbGciOiJIUz...` |
+| `RUN_TIME` | Daily execution time (HH:MM) | `08:15` |
+| `TZ` | Container timezone | `Europe/Helsinki` |
+
+---
+
+## 🛠️ Installation & Usage
+
+**1. Build and start the container:**
 
 ```bash
-python import_history_v2.py
+docker compose up -d
 ```
 
-### 3. Add to Energy Dashboard
-
-In HA, go to Settings > Dashboards > Energy and add tampereen_energia:imported_history as a Grid Consumption source.
-
-## 🐳 Part 2: Daily Scraper (Docker)
-
-This service runs 24/7 and fetches the previous day's hourly data every morning.
-### 1. Configuration
-
-Update the environment section in docker-compose.yml with your:
-
-    - TE_USERNAME / TE_PASSWORD
-      Credential for Tampereen Energia website
-
-    - TE_METERINGPOINT
-      If you have several metering points, put the name here. Something like TSV_FI_TKS***_*******
-
-    - HA_URL
-      URL of your Home Assistant instance
-
-    - HA_TOKEN
-      Long lived token for you HA https://www.home-assistant.io/docs/authentication/
-
-### 2. Launch
+**2. View real-time logs:**
 
 ```bash
-docker-compose up -d
+docker logs -f tampere_energy
 ```
 
-### 3. Dashboard Visualization
+**3. Force a clean rebuild:**
+If you ever update `main.py` or change `requirements.txt`, you *must* rebuild the image without using Docker's cache:
 
-How to add it to your Energy Dashboard:
-
-    * In Home Assistant, go to Settings > Dashboards > Energy.
-
-    * Under Electricity grid, click Add consumption.
-
-    * In the dropdown, search for Tampereen Energia History (or type tampereen_energia:imported_history).
-
-    * Save it.
-
-## 📦 Dependencies
-
-Ensure your requirements.txt contains:
-
-```Plaintext
-playwright
-schedule
-websockets
-python-dateutil
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
 
-## 💾 Local Data Access
-The Docker container maintains a local JSON backup on the host machine:
-* **Logs**: `./logs/scraper.log`
-* **Historical Data**: `./data/history.json`
-* **HA daily total**: `./data/ha_sync.json`
+---
 
-This data is persisted even if the container is rebuilt or deleted.
+## 📊 Viewing Data in Home Assistant
 
-## 📜 License
+The data is injected natively into Home Assistant's statistics engine under the ID: `tampereen_energia:imported_history`.
 
-Personal use only. Not affiliated with Tampereen Energia Oy.
+**Important Timing Notes:**
+1. **2-Day Offset:** The script fetches data from *2 days ago* to ensure the utility company has finalized the smart meter readings.
+2. **HA Processing Delay:** Home Assistant compiles its statistics database once per hour (usually at 12 minutes past the hour). Data injected at 10:15 will not appear in the dashboard until 11:12.
+
+**How to display it:**
+* **Energy Dashboard:** Go to *Settings > Dashboards > Energy*. Add a new grid consumption source and select `Tampereen Energia History`.
+* **Standard Dashboard:** Add a `Statistics Graph` card, select `Tampereen Energia History` as the entity, and set "Days to show" to at least 3.
+
+---
+
+## 💾 Local Backups
+Even if Home Assistant goes down, your data is safe. The container maintains files in your mapped `./data/` folder:
+* `history.json`: A continuous array of all successfully fetched daily/hourly data.
+* `ha_sync.json`: Tracks the total running sum required by Home Assistant's energy engine.
+* `scraper.log`: A persistent log of the script's execution history.
