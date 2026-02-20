@@ -23,8 +23,7 @@ Features:
 * **Python 3.9+** (For the history importer).
 * **Docker & Docker Compose** (For the daily scraper).
 * **Home Assistant:**
-  * [Long-Lived Access Token](https://www.home-assistant.io/docs/authentication/#long-lived-access-token) (for history).
-  * An **MQTT Broker** (e.g., Mosquitto Add-on) set up for the daily scraper.
+  * [Long-Lived Access Token](https://www.home-assistant.io/docs/authentication/#long-lived-access-token).
 
 ---
 
@@ -64,8 +63,16 @@ This service runs 24/7 and fetches the previous day's hourly data every morning.
 Update the environment section in docker-compose.yml with your:
 
     - TE_USERNAME / TE_PASSWORD
+      Credential for Tampereen Energia website
 
-    - MQTT_BROKER / MQTT_USER / MQTT_PASS
+    - TE_METERINGPOINT
+      If you have several metering points, put the name here. Something like TSV_FI_TKS***_*******
+
+    - HA_URL
+      URL of your Home Assistant instance
+
+    - HA_TOKEN
+      Long lived token for you HA https://www.home-assistant.io/docs/authentication/
 
 ### 2. Launch
 
@@ -75,23 +82,7 @@ docker-compose up -d
 
 ### 3. Dashboard Visualization
 
-The daily scraper creates an MQTT device with an hourly_data attribute. Use the ApexCharts Card to visualize it:
-
-```YAML
-type: custom:apexcharts-card
-graph_span: 24h
-span:
-  start: day
-series:
-  - entity: sensor.tampere_energy_daily
-    type: column
-    data_generator: |
-      return entity.attributes.hourly_data.map((value, index) => {
-        const date = new Date(entity.attributes.date + 'T00:00:00');
-        date.setHours(index);
-        return [date.getTime(), value];
-      });
-```
+The daily scraper updates the data so you can view it in you Energy-dashboard. Just add the tampereen_energia:imported_history to your energy-dashboard.
 
 ## 📦 Dependencies
 
@@ -99,7 +90,6 @@ Ensure your requirements.txt contains:
 
 ```Plaintext
 playwright
-paho-mqtt
 schedule
 websockets
 python-dateutil
@@ -109,6 +99,7 @@ python-dateutil
 The Docker container maintains a local JSON backup on the host machine:
 * **Logs**: `./logs/scraper.log`
 * **Historical Data**: `./data/history.json`
+* **HA daily total**: `./data/ha_sync.json`
 
 This data is persisted even if the container is rebuilt or deleted.
 
