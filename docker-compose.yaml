@@ -8,6 +8,8 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
+      - /etc/localtime:/etc/localtime:ro  # <--- Forces container to match host clock
+      - /etc/timezone:/etc/timezone:ro    # <--- Forces container to match host timezone
 
     # Prevent Docker system logs from growing infinitely
     logging:
