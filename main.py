@@ -2,11 +2,11 @@ import os
 import time
 import json
 import logging
-import schedule
 from datetime import datetime, timedelta, timezone
+import schedule
+from websockets.sync.client import connect
 from dateutil import tz
 from playwright.sync_api import sync_playwright
-from websockets.sync.client import connect
 
 # --- LOGGING SETUP ---
 log_dir = "/app/log"
@@ -49,11 +49,11 @@ def send_to_ha(extracted_data):
             ws.recv() # Wait for auth_required
             ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
             auth_res = json.loads(ws.recv())
-            
+
             if auth_res.get("type") != "auth_ok":
                 logging.error(f"HA Auth failed: {auth_res}")
                 return
-            
+
             # 2. Fetch the last known sum directly from Home Assistant
             # Checking back 14 days just to be safe in case the scraper was down for a week
             start_time = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
@@ -66,17 +66,17 @@ def send_to_ha(extracted_data):
             }
             ws.send(json.dumps(fetch_msg))
             fetch_res = json.loads(ws.recv())
-            
+
             running_sum = 0.0
             last_pushed_date = ""
-            
+
             if fetch_res.get("success"):
                 history_data = fetch_res.get("result", {}).get("tampereen_energia:imported_history", [])
                 if history_data:
                     # Grab the very last hour of data HA knows about
                     last_stat = history_data[-1]
                     running_sum = last_stat.get("sum", 0.0)
-                    
+
                     # HA returns 'start' as a unix timestamp in milliseconds
                     last_start_ms = last_stat.get("start", 0)
                     if last_start_ms:
@@ -121,13 +121,13 @@ def send_to_ha(extracted_data):
                 },
                 "stats": stats
             }
-            
+
             ws.send(json.dumps(push_msg))
             push_res = json.loads(ws.recv())
-            
+
             if push_res.get("success"):
                 logging.info(f"Successfully injected {len(stats)} hours into Home Assistant!")
-                
+
                 # Keep ha_sync.json purely for debugging visibility
                 try:
                     with open(sum_file, "w") as f:
@@ -140,14 +140,14 @@ def send_to_ha(extracted_data):
                     logging.warning(f"Could not update debug ha_sync.json: {e}")
             else:
                 logging.error(f"HA Import failed: {push_res}")
-                
+
     except Exception as e:
         logging.error(f"WebSocket Error: {e}")
 
 # --- PLAYWRIGHT SCRAPER ---
 def fetch_and_publish():
     logging.info("Starting consumption fetch sequence...")
-    
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 800})
@@ -190,10 +190,10 @@ def fetch_and_publish():
 
             page.wait_for_url("**/Home**", timeout=30000)
             page.goto("https://app.tampereenenergia.fi/PowerPlantDistributionPWA/Consumption", wait_until="networkidle")
-            
+
             try: page.wait_for_selector(".ppt_consumption_container, .chart-container", timeout=10000)
             except: pass
-            
+
             page.mouse.wheel(0, 400)
             time.sleep(2)
             page.mouse.wheel(0, -400)
@@ -213,15 +213,15 @@ def fetch_and_publish():
                 vars["FilterParameters"]["EndDate"] = end_str
                 vars["FilterParameters"]["PeriodId"] = 9
                 vars["IsHistoricaDataFetched"] = True
-                
+
                 if METERINGPOINT: vars["FilterParameters"]["MeteringPointId"] = METERINGPOINT
 
                 response = page.request.post(api_info["url"], data=payload, headers=api_info["headers"])
-                
+
                 if response.ok:
                     resp_json = response.json()
                     data_list = resp_json.get("data", {}).get("Dataset", {}).get("Data", {}).get("List", [])
-                    
+
                     if data_list:
                         hourly_values = [float(item["Consumption"]) for item in data_list]
                         extracted_data = {
@@ -233,7 +233,7 @@ def fetch_and_publish():
                         logging.info(f"Success! Fetched {len(hourly_values)} hourly points for {start_str[:10]}.")
         except Exception as e:
             logging.error(f"Scraper error: {e}")
-        
+
         browser.close()
 
         # --- PROCESS DATA ---
@@ -245,7 +245,7 @@ def fetch_and_publish():
                 try:
                     with open(history_file, 'r') as f: all_history = json.load(f)
                 except: pass
-            
+
             # Prevent duplicate entries in local history file
             if not any(entry['date'] == extracted_data['date'] for entry in all_history):
                 all_history.append(extracted_data)
@@ -253,13 +253,13 @@ def fetch_and_publish():
                 with open(history_file, 'w') as f:
                     json.dump(all_history, f, indent=4)
                 logging.info(f"Saved {extracted_data['date']} to local history.json")
-            
+
             # 2. Push to HA via Synchronous WebSocket
             send_to_ha(extracted_data)
 
 if __name__ == "__main__":
     fetch_and_publish()
-    
+
     rt = os.getenv("RUN_TIME", "08:15").replace('"', '')
     try:
         h, m = rt.split(":")
