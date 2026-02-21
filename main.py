@@ -40,54 +40,12 @@ def send_to_ha(extracted_data):
         logging.error("HA_URL or HA_TOKEN not configured. Skipping HA push.")
         return
 
-    sum_file = "/app/data/ha_sync.json"
-    running_sum = 0.0
-    last_pushed_date = ""
-
-    # Load existing sum AND the last pushed date
-    if os.path.exists(sum_file):
-        try:
-            with open(sum_file, "r") as f:
-                sync_data = json.load(f)
-                running_sum = sync_data.get("running_sum", 0.0)
-                last_pushed_date = sync_data.get("last_pushed_date", "")
-        except: pass
-
-    # Prevent duplicate pushing on container restart
     current_data_date = extracted_data["date"]
-    if current_data_date == last_pushed_date:
-        logging.info(f"Data for {current_data_date} already sent to HA. Skipping push to prevent negative spikes.")
-        return
-
-    stats = []
-    local_tz = tz.gettz("Europe/Helsinki")
-    base_time = datetime.strptime(current_data_date, "%Y-%m-%d").replace(tzinfo=local_tz)
-
-    for i, val in enumerate(extracted_data["hourly_data"]):
-        running_sum += float(val)
-        hour_time = base_time + timedelta(hours=i)
-        stats.append({
-            "start": hour_time.isoformat(),
-            "state": float(val),
-            "sum": round(running_sum, 3)
-        })
-
-    message = {
-        "id": int(time.time()),
-        "type": "recorder/import_statistics",
-        "metadata": {
-            "has_mean": False,
-            "has_sum": True,
-            "name": "Tampereen Energia History",
-            "source": "tampereen_energia",
-            "statistic_id": "tampereen_energia:imported_history",
-            "unit_of_measurement": "kWh"
-        },
-        "stats": stats
-    }
+    sum_file = "/app/data/ha_sync.json"
 
     try:
         with connect(HA_URL) as ws:
+            # 1. Authenticate
             ws.recv() # Wait for auth_required
             ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
             auth_res = json.loads(ws.recv())
@@ -96,19 +54,92 @@ def send_to_ha(extracted_data):
                 logging.error(f"HA Auth failed: {auth_res}")
                 return
             
-            ws.send(json.dumps(message))
-            res = json.loads(ws.recv())
+            # 2. Fetch the last known sum directly from Home Assistant
+            # Checking back 14 days just to be safe in case the scraper was down for a week
+            start_time = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            fetch_msg = {
+                "id": 101,
+                "type": "recorder/statistics_during_period",
+                "start_time": start_time,
+                "statistic_ids": ["tampereen_energia:imported_history"],
+                "period": "hour"
+            }
+            ws.send(json.dumps(fetch_msg))
+            fetch_res = json.loads(ws.recv())
             
-            if res.get("success"):
-                logging.info(f"Successfully injected {len(stats)} hours into Home Assistant!")
-                # Save both the new sum AND the date we just pushed
-                with open(sum_file, "w") as f:
-                    json.dump({
-                        "running_sum": running_sum,
-                        "last_pushed_date": current_data_date
-                    }, f)
+            running_sum = 0.0
+            last_pushed_date = ""
+            
+            if fetch_res.get("success"):
+                history_data = fetch_res.get("result", {}).get("tampereen_energia:imported_history", [])
+                if history_data:
+                    # Grab the very last hour of data HA knows about
+                    last_stat = history_data[-1]
+                    running_sum = last_stat.get("sum", 0.0)
+                    
+                    # HA returns 'start' as a unix timestamp in milliseconds
+                    last_start_ms = last_stat.get("start", 0)
+                    if last_start_ms:
+                        last_start_dt = datetime.fromtimestamp(last_start_ms / 1000.0, tz=timezone.utc)
+                        local_tz = tz.gettz("Europe/Helsinki")
+                        last_start_dt = last_start_dt.astimezone(local_tz)
+                        last_pushed_date = last_start_dt.strftime("%Y-%m-%d")
+                        logging.info(f"HA reports last data was on {last_pushed_date} with a sum of {running_sum} kWh.")
             else:
-                logging.error(f"HA Import failed: {res}")
+                logging.warning(f"Failed to fetch history from HA: {fetch_res}")
+
+            # 3. Prevent duplicate pushing based on HA's own database
+            if current_data_date == last_pushed_date:
+                logging.info(f"Data for {current_data_date} is already in HA. Skipping push to prevent negative spikes.")
+                return
+
+            # 4. Build the new statistics array, starting exactly where HA left off
+            stats = []
+            local_tz = tz.gettz("Europe/Helsinki")
+            base_time = datetime.strptime(current_data_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+
+            for i, val in enumerate(extracted_data["hourly_data"]):
+                running_sum += float(val)
+                hour_time = base_time + timedelta(hours=i)
+                stats.append({
+                    "start": hour_time.isoformat(),
+                    "state": float(val),
+                    "sum": round(running_sum, 3)
+                })
+
+            # 5. Push the calculated stats to HA
+            push_msg = {
+                "id": 102,
+                "type": "recorder/import_statistics",
+                "metadata": {
+                    "has_mean": False,
+                    "has_sum": True,
+                    "name": "Tampereen Energia History",
+                    "source": "tampereen_energia",
+                    "statistic_id": "tampereen_energia:imported_history",
+                    "unit_of_measurement": "kWh"
+                },
+                "stats": stats
+            }
+            
+            ws.send(json.dumps(push_msg))
+            push_res = json.loads(ws.recv())
+            
+            if push_res.get("success"):
+                logging.info(f"Successfully injected {len(stats)} hours into Home Assistant!")
+                
+                # Keep ha_sync.json purely for debugging visibility
+                try:
+                    with open(sum_file, "w") as f:
+                        json.dump({
+                            "running_sum": running_sum,
+                            "last_pushed_date": current_data_date,
+                            "note": "This file is for debugging. HA is the actual source of truth."
+                        }, f, indent=4)
+                except Exception as e:
+                    logging.warning(f"Could not update debug ha_sync.json: {e}")
+            else:
+                logging.error(f"HA Import failed: {push_res}")
                 
     except Exception as e:
         logging.error(f"WebSocket Error: {e}")
@@ -215,10 +246,9 @@ def fetch_and_publish():
                     with open(history_file, 'r') as f: all_history = json.load(f)
                 except: pass
             
-            # Prevent duplicate entries in local history file too
+            # Prevent duplicate entries in local history file
             if not any(entry['date'] == extracted_data['date'] for entry in all_history):
                 all_history.append(extracted_data)
-                # Sort by date to keep it clean
                 all_history = sorted(all_history, key=lambda x: x['date'])
                 with open(history_file, 'w') as f:
                     json.dump(all_history, f, indent=4)
