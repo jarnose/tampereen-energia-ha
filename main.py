@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 from websockets.sync.client import connect
 
 # --- LOGGING SETUP ---
-log_dir = "/app/data"
+log_dir = "/app/log"
 log_file = os.path.join(log_dir, "scraper.log")
 if not os.path.exists(log_dir): os.makedirs(log_dir)
 
