@@ -42,15 +42,20 @@ sudo chmod -R 777 data logs
 
 ## ⚙️ Configuration
 
-All configuration is handled via environment variables in your `docker-compose.yml` file:
+User credentials are handled via environment variables in your `.env` file:
 
 | Variable | Description | Example |
 | :--- | :--- | :--- |
 | `TE_USERNAME` | Tampereen Energia login email | `user@example.com` |
 | `TE_PASSWORD` | Tampereen Energia password | `MySecurePassword` |
-| `TE_METERINGPOINT` | Your specific meter ID | `TSV_FI_TKS000_6258986` |
-| `HA_URL` | Home Assistant WebSocket URL | `ws://192.168.1.100:8123/api/websocket` |
+| `TE_METERINGPOINT` | Your specific meter ID | `TSV_FI_TKSXX_XXXXXXX` |
+| `HA_URL` | Home Assistant WebSocket URL | `ws://192.168.X.X:8123/api/websocket` |
 | `HA_TOKEN` | Long-Lived Access Token from HA | `eyJhbGciOiJIUz...` |
+
+Configurations handled in docker-compose.yaml
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
 | `RUN_TIME` | Daily execution time (HH:MM) | `08:15` |
 | `TZ` | Container timezone | `Europe/Helsinki` |
 
