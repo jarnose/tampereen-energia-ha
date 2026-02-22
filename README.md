@@ -63,19 +63,26 @@ Configurations handled in docker-compose.yaml
 
 ## 🛠️ Installation & Usage
 
-**1. Build and start the container:**
+**1. Edit credentials:**
+```bash
+cp .env.example .env
+nano .env```
+
+Fill your username, password, HA-ipaddress and long lived token
+
+**2. Build and start the container:**
 
 ```bash
 docker compose up -d
 ```
 
-**2. View real-time logs:**
+**3. View real-time logs:**
 
 ```bash
 docker logs -f tampere_energy
 ```
 
-**3. Force a clean rebuild:**
+**4. Force a clean rebuild:**
 If you ever update `main.py` or change `requirements.txt`, you *must* rebuild the image without using Docker's cache:
 
 ```bash
