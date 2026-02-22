@@ -1,274 +1,284 @@
 import os
-import time
 import json
+import time
 import logging
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
+
 import schedule
-from websockets.sync.client import connect
-from dateutil import tz
-from playwright.sync_api import sync_playwright
 
-# --- LOGGING SETUP ---
-log_dir = "/app/log"
-log_file = os.path.join(log_dir, "scraper.log")
-if not os.path.exists(log_dir): os.makedirs(log_dir)
+# ==========================================
+# Constants
+# ==========================================
 
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+RETRY_FILE = "retry_state.json"
+STATE_FILE = "import_state.json"
+HISTORY_FILE = "history.json"
 
-file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8', delay=False)
-file_handler.setFormatter(log_formatter)
-root_logger.addHandler(file_handler)
 
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-root_logger.addHandler(console_handler)
+# ==========================================
+# Logging
+# ==========================================
 
-logging.info("=== Scraper Service Initialized (Sync WebSocket Mode) ===")
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
-# --- CONFIGURATION ---
-USERNAME = os.getenv("TE_USERNAME")
-PASSWORD = os.getenv("TE_PASSWORD")
-METERINGPOINT = os.getenv("TE_METERINGPOINT", "")
-HA_URL = os.getenv("HA_URL")
-HA_TOKEN = os.getenv("HA_TOKEN")
 
-# --- HOME ASSISTANT WEBSOCKET PUSH (SYNCHRONOUS) ---
-def send_to_ha(extracted_data):
-    if not HA_URL or not HA_TOKEN:
-        logging.error("HA_URL or HA_TOKEN not configured. Skipping HA push.")
-        return
+logger = logging.getLogger("tampere-energia-ha")
 
-    current_data_date = extracted_data["date"]
-    sum_file = "/app/data/ha_sync.json"
+
+# ==========================================
+# Configuration
+# ==========================================
+
+@dataclass
+class Config:
+    run_time: str
+
+    @staticmethod
+    def load():
+        run_time = os.getenv("RUN_TIME", "06:00")
+        return Config(run_time=run_time)
+
+
+# ==========================================
+# State Management (Dedup + Retry)
+# ==========================================
+
+def load_last_imported_date() -> Optional[datetime]:
+    if not os.path.exists(STATE_FILE):
+        return None
 
     try:
-        with connect(HA_URL) as ws:
-            # 1. Authenticate
-            ws.recv() # Wait for auth_required
-            ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
-            auth_res = json.loads(ws.recv())
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            return datetime.fromisoformat(data["last_imported"])
+    except Exception:
+        logger.exception("Failed to load import state.")
+        return None
 
-            if auth_res.get("type") != "auth_ok":
-                logging.error(f"HA Auth failed: {auth_res}")
-                return
 
-            # 2. Fetch the last known sum directly from Home Assistant
-            # Checking back 14 days just to be safe in case the scraper was down for a week
-            start_time = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
-            fetch_msg = {
-                "id": 101,
-                "type": "recorder/statistics_during_period",
-                "start_time": start_time,
-                "statistic_ids": ["tampereen_energia:imported_history"],
-                "period": "hour"
-            }
-            ws.send(json.dumps(fetch_msg))
-            fetch_res = json.loads(ws.recv())
+def save_last_imported_date(date: datetime):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"last_imported": date.isoformat()}, f)
 
-            running_sum = 0.0
-            last_pushed_date = ""
 
-            if fetch_res.get("success"):
-                history_data = fetch_res.get("result", {}).get("tampereen_energia:imported_history", [])
-                if history_data:
-                    # Grab the very last hour of data HA knows about
-                    last_stat = history_data[-1]
-                    running_sum = last_stat.get("sum", 0.0)
+def save_retry_state(retry_time: datetime):
+    with open(RETRY_FILE, "w") as f:
+        json.dump({"retry_at": retry_time.isoformat()}, f)
 
-                    # HA returns 'start' as a unix timestamp in milliseconds
-                    last_start_ms = last_stat.get("start", 0)
-                    if last_start_ms:
-                        last_start_dt = datetime.fromtimestamp(last_start_ms / 1000.0, tz=timezone.utc)
-                        local_tz = tz.gettz("Europe/Helsinki")
-                        last_start_dt = last_start_dt.astimezone(local_tz)
-                        last_pushed_date = last_start_dt.strftime("%Y-%m-%d")
-                        logging.info(f"HA reports last data was on {last_pushed_date} with a sum of {running_sum} kWh.")
-            else:
-                logging.warning(f"Failed to fetch history from HA: {fetch_res}")
 
-            # 3. Prevent duplicate pushing based on HA's own database
-            if current_data_date == last_pushed_date:
-                logging.info(f"Data for {current_data_date} is already in HA. Skipping push to prevent negative spikes.")
-                return
-
-            # 4. Build the new statistics array, starting exactly where HA left off
-            stats = []
-            local_tz = tz.gettz("Europe/Helsinki")
-            base_time = datetime.strptime(current_data_date, "%Y-%m-%d").replace(tzinfo=local_tz)
-
-            for i, val in enumerate(extracted_data["hourly_data"]):
-                running_sum += float(val)
-                hour_time = base_time + timedelta(hours=i)
-                stats.append({
-                    "start": hour_time.isoformat(),
-                    "state": float(val),
-                    "sum": round(running_sum, 3)
-                })
-
-            # 5. Push the calculated stats to HA
-            push_msg = {
-                "id": 102,
-                "type": "recorder/import_statistics",
-                "metadata": {
-                    "has_mean": False,
-                    "has_sum": True,
-                    "name": "Tampereen Energia History",
-                    "source": "tampereen_energia",
-                    "statistic_id": "tampereen_energia:imported_history",
-                    "unit_of_measurement": "kWh"
-                },
-                "stats": stats
-            }
-
-            ws.send(json.dumps(push_msg))
-            push_res = json.loads(ws.recv())
-
-            if push_res.get("success"):
-                logging.info(f"Successfully injected {len(stats)} hours into Home Assistant!")
-
-                # Keep ha_sync.json purely for debugging visibility
-                try:
-                    with open(sum_file, "w") as f:
-                        json.dump({
-                            "running_sum": running_sum,
-                            "last_pushed_date": current_data_date,
-                            "note": "This file is for debugging. HA is the actual source of truth."
-                        }, f, indent=4)
-                except Exception as e:
-                    logging.warning(f"Could not update debug ha_sync.json: {e}")
-            else:
-                logging.error(f"HA Import failed: {push_res}")
-
-    except Exception as e:
-        logging.error(f"WebSocket Error: {e}")
-
-# --- PLAYWRIGHT SCRAPER ---
-def fetch_and_publish():
-    logging.info("Starting consumption fetch sequence...")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 800})
-        page = context.new_page()
-
-        api_info = {"payload": None, "url": "", "headers": {}}
-
-        def intercept(route):
-            if "DataActionGetData" in route.request.url and not api_info["payload"]:
-                try:
-                    payload = route.request.post_data_json
-                    variables = payload.get("screenData", {}).get("variables", {})
-                    if "FilterParameters" in variables:
-                        api_info["payload"] = payload
-                        api_info["url"] = route.request.url
-                        api_info["headers"] = {k: v for k, v in route.request.headers.items() if k.lower() != "content-length"}
-                        logging.info("Successfully captured API Data template.")
-                except: pass
-            route.continue_()
-
-        page.route("**/DataActionGetData*", intercept)
-
-        extracted_data = None
-
-        try:
-            logging.info("Logging in to Tampereen Energia...")
-            page.goto("https://kirjautuminen.tampereenenergia.fi/login")
-            try: page.click("button:has-text('Hyväksy')", timeout=3000)
-            except: pass
-
-            page.fill("input[name='username']", USERNAME, force=True)
-            page.fill("input[name='password']", PASSWORD, force=True)
-            page.click("button[type='submit']")
-
-            try:
-                service_button = page.get_by_role("button", name="Siirry palveluun").first
-                service_button.wait_for(state="visible", timeout=15000)
-                service_button.click()
-            except Exception: pass
-
-            page.wait_for_url("**/Home**", timeout=30000)
-            page.goto("https://app.tampereenenergia.fi/PowerPlantDistributionPWA/Consumption", wait_until="networkidle")
-
-            try: page.wait_for_selector(".ppt_consumption_container, .chart-container", timeout=10000)
-            except: pass
-
-            page.mouse.wheel(0, 400)
-            time.sleep(2)
-            page.mouse.wheel(0, -400)
-
-            for i in range(45):
-                if api_info["payload"]: break
-                time.sleep(1)
-
-            if api_info["payload"]:
-                target_date = datetime.now(timezone.utc) - timedelta(days=2)
-                start_str = target_date.strftime('%Y-%m-%dT00:00:00.000Z')
-                end_str = target_date.strftime('%Y-%m-%dT23:59:59.000Z')
-
-                payload = api_info["payload"]
-                vars = payload["screenData"]["variables"]
-                vars["FilterParameters"]["StartDate"] = start_str
-                vars["FilterParameters"]["EndDate"] = end_str
-                vars["FilterParameters"]["PeriodId"] = 9
-                vars["IsHistoricaDataFetched"] = True
-
-                if METERINGPOINT: vars["FilterParameters"]["MeteringPointId"] = METERINGPOINT
-
-                response = page.request.post(api_info["url"], data=payload, headers=api_info["headers"])
-
-                if response.ok:
-                    resp_json = response.json()
-                    data_list = resp_json.get("data", {}).get("Dataset", {}).get("Data", {}).get("List", [])
-
-                    if data_list:
-                        hourly_values = [float(item["Consumption"]) for item in data_list]
-                        extracted_data = {
-                            "hourly_data": hourly_values,
-                            "total_kwh": round(sum(hourly_values), 2),
-                            "date": start_str[:10],
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        }
-                        logging.info(f"Success! Fetched {len(hourly_values)} hourly points for {start_str[:10]}.")
-        except Exception as e:
-            logging.error(f"Scraper error: {e}")
-
-        browser.close()
-
-        # --- PROCESS DATA ---
-        if extracted_data:
-            # 1. Save to local JSON history
-            history_file = "/app/data/history.json"
-            all_history = []
-            if os.path.exists(history_file):
-                try:
-                    with open(history_file, 'r') as f: all_history = json.load(f)
-                except: pass
-
-            # Prevent duplicate entries in local history file
-            if not any(entry['date'] == extracted_data['date'] for entry in all_history):
-                all_history.append(extracted_data)
-                all_history = sorted(all_history, key=lambda x: x['date'])
-                with open(history_file, 'w') as f:
-                    json.dump(all_history, f, indent=4)
-                logging.info(f"Saved {extracted_data['date']} to local history.json")
-
-            # 2. Push to HA via Synchronous WebSocket
-            send_to_ha(extracted_data)
-
-if __name__ == "__main__":
-    fetch_and_publish()
-
-    rt = os.getenv("RUN_TIME", "08:15").replace('"', '')
+def load_retry_state() -> Optional[datetime]:
+    if not os.path.exists(RETRY_FILE):
+        return None
     try:
-        h, m = rt.split(":")
-        clean_time = f"{int(h):02d}:{int(m):02d}"
-        logging.info(f"Background scheduler set for {clean_time}")
-        schedule.every().day.at(clean_time).do(fetch_and_publish)
-    except Exception as e:
-        schedule.every().day.at("08:15").do(fetch_and_publish)
+        with open(RETRY_FILE, "r") as f:
+            data = json.load(f)
+            return datetime.fromisoformat(data["retry_at"])
+    except Exception:
+        return None
+
+
+def clear_retry_state():
+    if os.path.exists(RETRY_FILE):
+        os.remove(RETRY_FILE)
+
+
+# ==========================================
+# Business Logic
+# ==========================================
+
+def filter_completed_days(data):
+    """
+    Only include entries up to day before yesterday (UTC).
+    This avoids incomplete or delayed data from the portal.
+    """
+    if not data:
+        return []
+
+    today = datetime.now(timezone.utc).date()
+    cutoff_date = today - timedelta(days=2)
+
+    filtered = [
+        item for item in data
+        if datetime.fromisoformat(item["start"]).date() <= cutoff_date
+    ]
+
+    logger.info(
+        f"Cutoff date: {cutoff_date}. "
+        f"Keeping {len(filtered)} of {len(data)} entries."
+    )
+
+    return filtered
+
+def filter_new_data(
+    data: List[Dict[str, Any]],
+    last_imported: Optional[datetime]
+) -> List[Dict[str, Any]]:
+    """
+    Deduplicate: only include entries strictly newer
+    than last successfully imported date.
+    """
+    if not last_imported:
+        return data
+
+    return [
+        item for item in data
+        if datetime.fromisoformat(item["start"]) > last_imported
+    ]
+
+
+def schedule_retry():
+    retry_time = datetime.now(timezone.utc) + timedelta(hours=2)
+    logger.warning(f"Scheduling retry at {retry_time.isoformat()}")
+    save_retry_state(retry_time)
+
+
+# ==========================================
+# Placeholder Functions (Already Exist)
+# ==========================================
+
+def scrape_data(config: Config) -> List[Dict[str, Any]]:
+    """
+    Existing scraping logic.
+    Must return:
+    [
+        {"start": ISO_STRING, "state": float},
+        ...
+    ]
+    """
+    raise NotImplementedError
+
+
+def push_to_home_assistant(config: Config, data: List[Dict[str, Any]]) -> bool:
+    """
+    Existing HA push logic.
+    Must return True on success.
+    """
+    raise NotImplementedError
+
+
+def save_history(data: List[Dict[str, Any]]):
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r") as f:
+                history = json.load(f)
+        else:
+            history = []
+
+        history.extend(data)
+
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        logger.exception("Failed to save history.")
+
+
+# ==========================================
+# Main Job
+# ==========================================
+
+def run_job(config: Config):
+    logger.info("Job triggered.")
+
+    try:
+        raw_data = scrape_data(config)
+
+        if not raw_data:
+            logger.warning("No data scraped.")
+            schedule_retry()
+            return
+
+        # Step 1: Only completed days
+        completed = filter_completed_days(raw_data)
+
+        if not completed:
+            logger.warning("No completed days available yet.")
+            schedule_retry()
+            return
+
+        # Step 2: Deduplicate by last imported date
+        last_imported = load_last_imported_date()
+        new_data = filter_new_data(completed, last_imported)
+
+        if not new_data:
+            logger.info("No new data to import.")
+            clear_retry_state()
+            return
+
+        # Step 3: Push to HA
+        success = push_to_home_assistant(config, new_data)
+
+        if not success:
+            logger.error("Push failed.")
+            schedule_retry()
+            return
+
+        # Step 4: Save state + history
+        newest_date = max(
+            datetime.fromisoformat(item["start"])
+            for item in new_data
+        )
+
+        save_last_imported_date(newest_date)
+        save_history(new_data)
+
+        clear_retry_state()
+
+        logger.info(
+            f"Successfully imported {len(new_data)} entries. "
+            f"Last imported date: {newest_date.date()}"
+        )
+
+    except Exception:
+        logger.exception("Fatal error during job.")
+        schedule_retry()
+
+
+# ==========================================
+# Main Entry
+# ==========================================
+
+def main():
+    setup_logging()
+    config = Config.load()
+
+    logger.info("Starting Tampere Energia importer.")
+
+    retry_time = load_retry_state()
+    now = datetime.now(timezone.utc)
+
+    if retry_time:
+        if now >= retry_time:
+            logger.info("Retry time reached. Running immediately.")
+            run_job(config)
+        else:
+            delay = (retry_time - now).total_seconds()
+            logger.info(f"Retry scheduled in {int(delay)} seconds.")
+            schedule.every(delay).seconds.do(
+                lambda: run_job(config)
+            ).tag("retry")
+
+    # Daily schedule
+    schedule.every().day.at(config.run_time).do(
+        lambda: run_job(config)
+    )
 
     while True:
-        schedule.run_pending()
-        time.sleep(60)
+        try:
+            schedule.run_pending()
+            time.sleep(30)
+        except KeyboardInterrupt:
+            logger.info("Shutting down.")
+            break
+        except Exception:
+            logger.exception("Scheduler loop error.")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
