@@ -26,6 +26,7 @@ Ensure your project directory looks like this:
 ├── requirements.txt
 ├── import_history.py
 ├── main.py
+├── .env.example
 ├── data/           # Host-mapped volume (contains history.json and ha_sync.json)
 ├── logs/           # Host-mapped volume (scraper.log)
 ```

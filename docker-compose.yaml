@@ -3,10 +3,11 @@ services:
     build: .
     container_name: tampere_energy
     restart: unless-stopped
+    env_file:
+     - .env
 
     # Map the host's log folder to the container
     volumes:
-      - ./logs:/app/logs
       - ./data:/app/data
       - /etc/localtime:/etc/localtime:ro  # <--- Forces container to match host clock
       - /etc/timezone:/etc/timezone:ro    # <--- Forces container to match host timezone
@@ -23,10 +24,3 @@ services:
       - PYTHONUNBUFFERED=1
       - TZ=Europe/Helsinki
       - RUN_TIME=8:15
-      # Tampereen Energia Credentials
-      - TE_USERNAME=
-      - TE_PASSWORD=
-      - TE_METERINGPOINT=
-      # Home Assistant WebSocket Details
-      - HA_URL=ws://192.168.X.X:8123/api/websocket
-      - HA_TOKEN=
