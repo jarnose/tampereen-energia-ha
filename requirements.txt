@@ -2,3 +2,4 @@ playwright==1.58.0
 schedule
 websockets
 python-dateutil
+requests>=2.31.0
