@@ -23,4 +23,4 @@ services:
       # Timezone ensures the schedule runs at 08:15 Finnish time, not UTC
       - PYTHONUNBUFFERED=1
       - TZ=Europe/Helsinki
-      - RUN_TIME=8:15
+      - RUN_TIME=08:15
