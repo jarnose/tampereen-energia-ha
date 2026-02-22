@@ -66,7 +66,8 @@ Configurations handled in docker-compose.yaml
 **1. Edit credentials:**
 ```bash
 cp .env.example .env
-nano .env```
+nano .env
+```
 
 Fill your username, password, HA-ipaddress and long lived token
 
