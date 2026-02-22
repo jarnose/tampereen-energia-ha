@@ -27,15 +27,14 @@ Ensure your project directory looks like this:
 ├── import_history.py
 ├── main.py
 ├── .env.example
-├── data/           # Host-mapped volume (contains history.json and ha_sync.json)
-├── logs/           # Host-mapped volume (scraper.log)
+├── data/           # Host-mapped volume (contains history.json, ha_sync.json and scraper.log)
 ```
 
 **Crucial Permission Note:** Docker runs the Python script internally, but it needs permission to write to your host machine's `data` folder. Before running for the first time, ensure the folder exists and is writable:
 
 ```bash
-mkdir -p data logs
-sudo chmod -R 777 data logs
+mkdir -p data
+sudo chmod -R 775 data
 ```
 
 ---
@@ -100,7 +99,8 @@ The data is injected natively into Home Assistant's statistics engine under the 
 
 **Important Timing Notes:**
 1. **2-Day Offset:** The script fetches data from *2 days ago* to ensure the utility company has finalized the smart meter readings.
-2. **HA Processing Delay:** Home Assistant compiles its statistics database once per hour (usually at 12 minutes past the hour). Data injected at 10:15 will not appear in the dashboard until 11:12.
+2. **Retry:** If the data for the fetched day is not full, try again after an hour.
+3. **HA Processing Delay:** Home Assistant compiles its statistics database once per hour (usually at 12 minutes past the hour). Data injected at 10:15 will not appear in the dashboard until 11:12.
 
 **How to display it:**
 * **Energy Dashboard:** Go to *Settings > Dashboards > Energy*. Add a new grid consumption source and select `Tampereen Energia History`.
