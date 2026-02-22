@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+import_state.json
+retry_state.json
+history.json
