@@ -1,177 +1,313 @@
 import os
 import json
+import time
 import logging
+import schedule
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import List, Dict, Any
+from dateutil import tz
 
-import requests
+from playwright.sync_api import sync_playwright
+from websockets.sync.client import connect
 
-# -----------------------------------------------------------------------------
-# Configuration
-# -----------------------------------------------------------------------------
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
 
-TE_API_URL = os.getenv("TE_API_URL")
-HA_URL = os.getenv("HA_URL")
-HA_TOKEN = os.getenv("HA_TOKEN")
-
-STATE_FILE = Path("import_state.json")
-VALID_STATUSES = {"Mitattu"}  # Add "Korjattu" here if needed
+DATA_DIR = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(DATA_DIR, "scraper.log")),
+        logging.StreamHandler()
+    ],
 )
 
-# -----------------------------------------------------------------------------
-# State handling
-# -----------------------------------------------------------------------------
+logging.info("=== Tampere Energia Scraper Started ===")
 
-def load_state() -> Dict[str, Any]:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
+# --------------------------------------------------
+# ENV
+# --------------------------------------------------
 
+USERNAME = os.getenv("TE_USERNAME")
+PASSWORD = os.getenv("TE_PASSWORD")
+METERINGPOINT = os.getenv("TE_METERINGPOINT", "")
+HA_URL = os.getenv("HA_URL")
+HA_TOKEN = os.getenv("HA_TOKEN")
+RUN_TIME = os.getenv("RUN_TIME", "06:15").replace('"', "")
 
-def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+STATISTIC_ID = "tampereen_energia:imported_history"
 
+# --------------------------------------------------
+# FETCH CONSUMPTION (MEASURED ONLY)
+# --------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# Tampere Energia data handling
-# -----------------------------------------------------------------------------
+def fetch_consumption():
 
-def fetch_data() -> Dict[str, Any]:
-    logging.info("Fetching data from Tampere Energia API")
-    response = requests.get(TE_API_URL, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    target_date = datetime.now(timezone.utc) - timedelta(days=2)
+    date_str = target_date.strftime("%Y-%m-%d")
 
+    logging.info(f"Fetching data for {date_str}")
 
-def extract_measured_entries(chart_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Extract only rows marked as 'Mitattu' and convert to structured entries.
-    """
-    entries = []
+    with sync_playwright() as p:
 
-    for item in chart_data.get("List", []):
-        status = item.get("StatusDescriptionName")
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        page = context.new_page()
 
-        if status not in VALID_STATUSES:
-            continue
+        api_info = {"payload": None, "url": "", "headers": {}}
+
+        def intercept(route):
+            if "DataActionGetData" in route.request.url and not api_info["payload"]:
+                try:
+                    payload = route.request.post_data_json
+                    variables = payload.get("screenData", {}).get("variables", {})
+                    if "FilterParameters" in variables:
+                        api_info["payload"] = payload
+                        api_info["url"] = route.request.url
+                        api_info["headers"] = {
+                            k: v for k, v in route.request.headers.items()
+                            if k.lower() != "content-length"
+                        }
+                        logging.info("Captured API template.")
+                except:
+                    pass
+            route.continue_()
+
+        page.route("**/DataActionGetData*", intercept)
+
+        # LOGIN
+        page.goto("https://kirjautuminen.tampereenenergia.fi/login")
 
         try:
-            start = datetime.fromisoformat(item["DateFrom"].replace("Z", "+00:00"))
-            value = float(item["Consumption"])
-        except (KeyError, ValueError):
-            continue
+            page.click("button:has-text('Hyväksy')", timeout=3000)
+        except:
+            pass
 
-        entries.append({
-            "timestamp": start,
-            "value": value,
-        })
+        page.fill("input[name='username']", USERNAME, force=True)
+        page.fill("input[name='password']", PASSWORD, force=True)
+        page.click("button[type='submit']")
 
-    return entries
+        try:
+            service_button = page.get_by_role("button", name="Siirry palveluun").first
+            service_button.wait_for(state="visible", timeout=15000)
+            service_button.click()
+        except:
+            pass
 
+        page.wait_for_url("**/Home**", timeout=30000)
 
-# -----------------------------------------------------------------------------
-# Filtering logic
-# -----------------------------------------------------------------------------
+        page.goto(
+            "https://app.tampereenenergia.fi/PowerPlantDistributionPWA/Consumption",
+            wait_until="networkidle"
+        )
 
-def filter_completed_days(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Only keep data up to day before yesterday (local time).
-    """
-    today = datetime.now(timezone.utc).date()
-    cutoff_date = today - timedelta(days=2)
+        try:
+            page.wait_for_selector(
+                ".ppt_consumption_container, .chart-container",
+                timeout=15000
+            )
+        except:
+            logging.warning("Chart container not detected.")
 
-    return [
-        e for e in entries
-        if e["timestamp"].date() <= cutoff_date
-    ]
+        page.mouse.wheel(0, 400)
+        time.sleep(2)
+        page.mouse.wheel(0, -400)
 
+        for _ in range(45):
+            if api_info["payload"]:
+                break
+            time.sleep(1)
 
-def filter_new_entries(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Deduplicate based on last imported timestamp.
-    """
-    last_imported_str = state.get("last_imported")
+        if not api_info["payload"]:
+            browser.close()
+            raise RuntimeError("Failed to capture API template")
 
-    if not last_imported_str:
-        return entries
+        start_str = target_date.strftime('%Y-%m-%dT00:00:00.000Z')
+        end_str = target_date.strftime('%Y-%m-%dT23:59:59.000Z')
 
-    last_imported = datetime.fromisoformat(last_imported_str)
+        payload = api_info["payload"]
+        variables = payload["screenData"]["variables"]
+        filter_params = variables["FilterParameters"]
 
-    return [
-        e for e in entries
-        if e["timestamp"] > last_imported
-    ]
+        filter_params["StartDate"] = start_str
+        filter_params["EndDate"] = end_str
+        filter_params["PeriodId"] = 9
+        variables["IsHistoricaDataFetched"] = True
 
+        if METERINGPOINT:
+            filter_params["MeteringPointId"] = METERINGPOINT
 
-# -----------------------------------------------------------------------------
-# Home Assistant integration
-# -----------------------------------------------------------------------------
+        response = page.request.post(
+            api_info["url"],
+            data=payload,
+            headers=api_info["headers"]
+        )
 
-def send_to_home_assistant(entries: List[Dict[str, Any]]) -> None:
-    if not entries:
-        logging.info("No new entries to send.")
-        return
+        if not response.ok:
+            browser.close()
+            raise RuntimeError("Consumption API request failed")
 
-    headers = {
-        "Authorization": f"Bearer {HA_TOKEN}",
-        "Content-Type": "application/json",
-    }
+        resp_json = response.json()
+        browser.close()
 
-    for entry in entries:
-        payload = {
-            "state": entry["value"],
-            "attributes": {
-                "device_class": "energy",
-                "unit_of_measurement": "kWh",
-            }
+        dataset = resp_json.get("data", {}).get("Dataset", {})
+        chart_data = dataset.get("ChartData", {}).get("List", [])
+
+        if not chart_data:
+            raise RuntimeError("No chart data found")
+
+        measured_rows = [
+            row for row in chart_data
+            if row.get("StatusDescriptionName") == "Mitattu"
+        ]
+
+        if len(measured_rows) != 24:
+            logging.info(
+                f"Not fully measured yet ({len(measured_rows)}/24 hours)."
+            )
+            return None
+
+        hourly_values = [float(row["Consumption"]) for row in measured_rows]
+
+        logging.info("Day fully measured ✔")
+
+        return {
+            "hourly_data": hourly_values,
+            "date": date_str
         }
 
-        url = f"{HA_URL}/api/states/sensor.tampereen_energia_hourly"
+# --------------------------------------------------
+# HOME ASSISTANT PUSH
+# --------------------------------------------------
 
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+def send_to_ha(data):
 
-        if response.status_code not in (200, 201):
-            logging.error("Failed to push to HA: %s", response.text)
-            response.raise_for_status()
-
-    logging.info("Pushed %d entries to Home Assistant", len(entries))
-
-
-# -----------------------------------------------------------------------------
-# Main flow
-# -----------------------------------------------------------------------------
-
-def main():
-    if not all([TE_API_URL, HA_URL, HA_TOKEN]):
-        raise RuntimeError("Missing required environment variables")
-
-    state = load_state()
-
-    raw_data = fetch_data()
-    entries = extract_measured_entries(raw_data)
-
-    entries = filter_completed_days(entries)
-    entries = filter_new_entries(entries, state)
-
-    if not entries:
-        logging.info("Nothing new to import.")
+    if not HA_URL or not HA_TOKEN:
+        logging.error("HA credentials missing.")
         return
 
-    entries.sort(key=lambda x: x["timestamp"])
+    with connect(HA_URL) as ws:
 
-    send_to_home_assistant(entries)
+        ws.recv()
+        ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+        if json.loads(ws.recv()).get("type") != "auth_ok":
+            logging.error("HA authentication failed.")
+            return
 
-    # Persist last imported timestamp
-    state["last_imported"] = entries[-1]["timestamp"].isoformat()
-    save_state(state)
+        start_time = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
 
-    logging.info("Import completed successfully.")
+        ws.send(json.dumps({
+            "id": 1,
+            "type": "recorder/statistics_during_period",
+            "start_time": start_time,
+            "statistic_ids": [STATISTIC_ID],
+            "period": "hour"
+        }))
 
+        history = json.loads(ws.recv()).get("result", {}).get(STATISTIC_ID, [])
+
+        running_sum = 0
+        last_date = ""
+
+        if history:
+            last_stat = history[-1]
+            running_sum = last_stat.get("sum", 0)
+
+            last_start = last_stat.get("start", 0)
+            if last_start:
+                dt = datetime.fromtimestamp(last_start / 1000, tz=timezone.utc)
+                dt = dt.astimezone(tz.gettz("Europe/Helsinki"))
+                last_date = dt.strftime("%Y-%m-%d")
+
+        if data["date"] == last_date:
+            logging.info(f"{data['date']} already imported — skipping.")
+            return True
+
+        stats = []
+        helsinki = tz.gettz("Europe/Helsinki")
+        base_time = datetime.strptime(data["date"], "%Y-%m-%d").replace(tzinfo=helsinki)
+
+        for i, value in enumerate(data["hourly_data"]):
+            running_sum += float(value)
+            stats.append({
+                "start": (base_time + timedelta(hours=i)).isoformat(),
+                "state": float(value),
+                "sum": round(running_sum, 3)
+            })
+
+        ws.send(json.dumps({
+            "id": 2,
+            "type": "recorder/import_statistics",
+            "metadata": {
+                "has_mean": False,
+                "has_sum": True,
+                "name": "Tampereen Energia",
+                "source": "tampereen_energia",
+                "statistic_id": STATISTIC_ID,
+                "unit_of_measurement": "kWh"
+            },
+            "stats": stats
+        }))
+
+        result = json.loads(ws.recv())
+        if result.get("success"):
+            logging.info("Successfully injected into Home Assistant.")
+            return True
+
+        return False
+
+# --------------------------------------------------
+# JOB WITH HOURLY RETRY
+# --------------------------------------------------
+
+def job():
+    try:
+        data = fetch_consumption()
+
+        if not data:
+            return
+
+        success = send_to_ha(data)
+
+        if success:
+            logging.info("Import completed. Waiting until next day.")
+
+    except Exception as e:
+        logging.error(f"Job failed: {e}")
+
+# --------------------------------------------------
+# MAIN LOOP
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+
+    if not USERNAME or not PASSWORD:
+        logging.error("Missing Tampere Energia credentials.")
+        exit(1)
+
+    # Run immediately on start
+    job()
+
+    # Clean and normalize RUN_TIME
+    try:
+        raw_time = RUN_TIME.strip().replace('"', '')
+        h, m = raw_time.split(":")
+        RUN_TIME_CLEAN = f"{int(h):02d}:{int(m):02d}"
+    except Exception:
+        logging.warning("Invalid RUN_TIME format. Falling back to 06:15")
+        RUN_TIME_CLEAN = "06:15"
+
+    # Daily safety trigger
+    schedule.every().day.at(RUN_TIME_CLEAN).do(job)
+
+    # Hourly retry until measured
+    schedule.every().hour.do(job)
+
+    logging.info("Scheduler started (hourly retry + daily trigger).")
+
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
