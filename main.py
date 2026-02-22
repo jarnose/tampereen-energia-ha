@@ -1,283 +1,176 @@
 import os
 import json
-import time
 import logging
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Dict, Any
 
-import schedule
+import requests
 
-# ==========================================
-# Constants
-# ==========================================
-
-RETRY_FILE = "retry_state.json"
-STATE_FILE = "import_state.json"
-HISTORY_FILE = "history.json"
-
-
-# ==========================================
-# Logging
-# ==========================================
-
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-
-
-logger = logging.getLogger("tampere-energia-ha")
-
-
-# ==========================================
+# -----------------------------------------------------------------------------
 # Configuration
-# ==========================================
+# -----------------------------------------------------------------------------
 
-@dataclass
-class Config:
-    run_time: str
+TE_API_URL = os.getenv("TE_API_URL")
+HA_URL = os.getenv("HA_URL")
+HA_TOKEN = os.getenv("HA_TOKEN")
 
-    @staticmethod
-    def load():
-        run_time = os.getenv("RUN_TIME", "06:00")
-        return Config(run_time=run_time)
+STATE_FILE = Path("import_state.json")
+VALID_STATUSES = {"Mitattu"}  # Add "Korjattu" here if needed
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-# ==========================================
-# State Management (Dedup + Retry)
-# ==========================================
+# -----------------------------------------------------------------------------
+# State handling
+# -----------------------------------------------------------------------------
 
-def load_last_imported_date() -> Optional[datetime]:
-    if not os.path.exists(STATE_FILE):
-        return None
-
-    try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-            return datetime.fromisoformat(data["last_imported"])
-    except Exception:
-        logger.exception("Failed to load import state.")
-        return None
+def load_state() -> Dict[str, Any]:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
 
 
-def save_last_imported_date(date: datetime):
-    with open(STATE_FILE, "w") as f:
-        json.dump({"last_imported": date.isoformat()}, f)
+def save_state(state: Dict[str, Any]) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def save_retry_state(retry_time: datetime):
-    with open(RETRY_FILE, "w") as f:
-        json.dump({"retry_at": retry_time.isoformat()}, f)
+# -----------------------------------------------------------------------------
+# Tampere Energia data handling
+# -----------------------------------------------------------------------------
+
+def fetch_data() -> Dict[str, Any]:
+    logging.info("Fetching data from Tampere Energia API")
+    response = requests.get(TE_API_URL, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
-def load_retry_state() -> Optional[datetime]:
-    if not os.path.exists(RETRY_FILE):
-        return None
-    try:
-        with open(RETRY_FILE, "r") as f:
-            data = json.load(f)
-            return datetime.fromisoformat(data["retry_at"])
-    except Exception:
-        return None
-
-
-def clear_retry_state():
-    if os.path.exists(RETRY_FILE):
-        os.remove(RETRY_FILE)
-
-
-# ==========================================
-# Business Logic
-# ==========================================
-
-def filter_completed_days(data):
+def extract_measured_entries(chart_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Only include entries up to day before yesterday (UTC).
-    This avoids incomplete or delayed data from the portal.
+    Extract only rows marked as 'Mitattu' and convert to structured entries.
     """
-    if not data:
-        return []
+    entries = []
 
+    for item in chart_data.get("List", []):
+        status = item.get("StatusDescriptionName")
+
+        if status not in VALID_STATUSES:
+            continue
+
+        try:
+            start = datetime.fromisoformat(item["DateFrom"].replace("Z", "+00:00"))
+            value = float(item["Consumption"])
+        except (KeyError, ValueError):
+            continue
+
+        entries.append({
+            "timestamp": start,
+            "value": value,
+        })
+
+    return entries
+
+
+# -----------------------------------------------------------------------------
+# Filtering logic
+# -----------------------------------------------------------------------------
+
+def filter_completed_days(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Only keep data up to day before yesterday (local time).
+    """
     today = datetime.now(timezone.utc).date()
     cutoff_date = today - timedelta(days=2)
 
-    filtered = [
-        item for item in data
-        if datetime.fromisoformat(item["start"]).date() <= cutoff_date
+    return [
+        e for e in entries
+        if e["timestamp"].date() <= cutoff_date
     ]
 
-    logger.info(
-        f"Cutoff date: {cutoff_date}. "
-        f"Keeping {len(filtered)} of {len(data)} entries."
-    )
 
-    return filtered
+def filter_new_entries(entries: List[Dict[str, Any]], state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Deduplicate based on last imported timestamp.
+    """
+    last_imported_str = state.get("last_imported")
 
-def filter_new_data(
-    data: List[Dict[str, Any]],
-    last_imported: Optional[datetime]
-) -> List[Dict[str, Any]]:
-    """
-    Deduplicate: only include entries strictly newer
-    than last successfully imported date.
-    """
-    if not last_imported:
-        return data
+    if not last_imported_str:
+        return entries
+
+    last_imported = datetime.fromisoformat(last_imported_str)
 
     return [
-        item for item in data
-        if datetime.fromisoformat(item["start"]) > last_imported
+        e for e in entries
+        if e["timestamp"] > last_imported
     ]
 
 
-def schedule_retry():
-    retry_time = datetime.now(timezone.utc) + timedelta(hours=2)
-    logger.warning(f"Scheduling retry at {retry_time.isoformat()}")
-    save_retry_state(retry_time)
+# -----------------------------------------------------------------------------
+# Home Assistant integration
+# -----------------------------------------------------------------------------
+
+def send_to_home_assistant(entries: List[Dict[str, Any]]) -> None:
+    if not entries:
+        logging.info("No new entries to send.")
+        return
+
+    headers = {
+        "Authorization": f"Bearer {HA_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    for entry in entries:
+        payload = {
+            "state": entry["value"],
+            "attributes": {
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+            }
+        }
+
+        url = f"{HA_URL}/api/states/sensor.tampereen_energia_hourly"
+
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+        if response.status_code not in (200, 201):
+            logging.error("Failed to push to HA: %s", response.text)
+            response.raise_for_status()
+
+    logging.info("Pushed %d entries to Home Assistant", len(entries))
 
 
-# ==========================================
-# Placeholder Functions (Already Exist)
-# ==========================================
-
-def scrape_data(config: Config) -> List[Dict[str, Any]]:
-    """
-    Existing scraping logic.
-    Must return:
-    [
-        {"start": ISO_STRING, "state": float},
-        ...
-    ]
-    """
-    raise NotImplementedError
-
-
-def push_to_home_assistant(config: Config, data: List[Dict[str, Any]]) -> bool:
-    """
-    Existing HA push logic.
-    Must return True on success.
-    """
-    raise NotImplementedError
-
-
-def save_history(data: List[Dict[str, Any]]):
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r") as f:
-                history = json.load(f)
-        else:
-            history = []
-
-        history.extend(data)
-
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
-    except Exception:
-        logger.exception("Failed to save history.")
-
-
-# ==========================================
-# Main Job
-# ==========================================
-
-def run_job(config: Config):
-    logger.info("Job triggered.")
-
-    try:
-        raw_data = scrape_data(config)
-
-        if not raw_data:
-            logger.warning("No data scraped.")
-            schedule_retry()
-            return
-
-        # Step 1: Only completed days
-        completed = filter_completed_days(raw_data)
-
-        if not completed:
-            logger.warning("No completed days available yet.")
-            schedule_retry()
-            return
-
-        # Step 2: Deduplicate by last imported date
-        last_imported = load_last_imported_date()
-        new_data = filter_new_data(completed, last_imported)
-
-        if not new_data:
-            logger.info("No new data to import.")
-            clear_retry_state()
-            return
-
-        # Step 3: Push to HA
-        success = push_to_home_assistant(config, new_data)
-
-        if not success:
-            logger.error("Push failed.")
-            schedule_retry()
-            return
-
-        # Step 4: Save state + history
-        newest_date = max(
-            datetime.fromisoformat(item["start"])
-            for item in new_data
-        )
-
-        save_last_imported_date(newest_date)
-        save_history(new_data)
-
-        clear_retry_state()
-
-        logger.info(
-            f"Successfully imported {len(new_data)} entries. "
-            f"Last imported date: {newest_date.date()}"
-        )
-
-    except Exception:
-        logger.exception("Fatal error during job.")
-        schedule_retry()
-
-
-# ==========================================
-# Main Entry
-# ==========================================
+# -----------------------------------------------------------------------------
+# Main flow
+# -----------------------------------------------------------------------------
 
 def main():
-    setup_logging()
-    config = Config.load()
+    if not all([TE_API_URL, HA_URL, HA_TOKEN]):
+        raise RuntimeError("Missing required environment variables")
 
-    logger.info("Starting Tampere Energia importer.")
+    state = load_state()
 
-    retry_time = load_retry_state()
-    now = datetime.now(timezone.utc)
+    raw_data = fetch_data()
+    entries = extract_measured_entries(raw_data)
 
-    if retry_time:
-        if now >= retry_time:
-            logger.info("Retry time reached. Running immediately.")
-            run_job(config)
-        else:
-            delay = (retry_time - now).total_seconds()
-            logger.info(f"Retry scheduled in {int(delay)} seconds.")
-            schedule.every(delay).seconds.do(
-                lambda: run_job(config)
-            ).tag("retry")
+    entries = filter_completed_days(entries)
+    entries = filter_new_entries(entries, state)
 
-    # Daily schedule
-    schedule.every().day.at(config.run_time).do(
-        lambda: run_job(config)
-    )
+    if not entries:
+        logging.info("Nothing new to import.")
+        return
 
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(30)
-        except KeyboardInterrupt:
-            logger.info("Shutting down.")
-            break
-        except Exception:
-            logger.exception("Scheduler loop error.")
-            time.sleep(10)
+    entries.sort(key=lambda x: x["timestamp"])
+
+    send_to_home_assistant(entries)
+
+    # Persist last imported timestamp
+    state["last_imported"] = entries[-1]["timestamp"].isoformat()
+    save_state(state)
+
+    logging.info("Import completed successfully.")
 
 
 if __name__ == "__main__":
