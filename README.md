@@ -12,6 +12,7 @@ The extracted 24-hour data points are saved to a local JSON backup and injected 
 * **Direct HA Integration:** Pushes data into Home Assistant's native statistics engine via WebSocket (no custom sensors or MQTT required).
 * **Local Persistence:** Maintains a running sum (`ha_sync.json`) and an offline history backup (`history.json`).
 * **Robust Scheduling:** Uses the `schedule` library to run automatically every day at a specified time.
+* **History Import:** Separate python-script to import historical daily totals.
 
 ---
 
@@ -23,6 +24,7 @@ Ensure your project directory looks like this:
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
+├── import_history.py
 ├── main.py
 ├── data/           # Host-mapped volume (contains history.json and ha_sync.json)
 ├── logs/           # Host-mapped volume (scraper.log)
