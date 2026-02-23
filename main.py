@@ -72,7 +72,7 @@ def fetch_consumption():
                             if k.lower() != "content-length"
                         }
                         logging.info("Captured API template.")
-                except:
+                except Exception as e:
                     pass
             route.continue_()
 
@@ -101,7 +101,7 @@ def fetch_consumption():
 
         page.goto(
             "https://app.tampereenenergia.fi/PowerPlantDistributionPWA/Consumption",
-            wait_until="networkidle"
+            wait_until="networkidle" # Let the SPA load completely
         )
 
         try:
@@ -112,18 +112,15 @@ def fetch_consumption():
         except:
             logging.warning("Chart container not detected.")
 
-        page.mouse.wheel(0, 400)
-        time.sleep(2)
-        page.mouse.wheel(0, -400)
-
-        for _ in range(45):
-            if api_info["payload"]:
-                break
-            time.sleep(1)
+        # Replaced the manual time.sleep loop with a proper wait for network idle
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except:
+            logging.warning("Network did not reach idle state within timeout, proceeding anyway.")
 
         if not api_info["payload"]:
             browser.close()
-            raise RuntimeError("Failed to capture API template")
+            raise RuntimeError("Failed to capture API template. The interceptor didn't catch the request.")
 
         start_str = target_date.strftime('%Y-%m-%dT00:00:00.000Z')
         end_str = target_date.strftime('%Y-%m-%dT23:59:59.000Z')
@@ -148,7 +145,7 @@ def fetch_consumption():
 
         if not response.ok:
             browser.close()
-            raise RuntimeError("Consumption API request failed")
+            raise RuntimeError(f"Consumption API request failed with status {response.status}")
 
         resp_json = response.json()
         browser.close()
@@ -157,7 +154,7 @@ def fetch_consumption():
         chart_data = dataset.get("ChartData", {}).get("List", [])
 
         if not chart_data:
-            raise RuntimeError("No chart data found")
+            raise RuntimeError("No chart data found in the API response.")
 
         measured_rows = [
             row for row in chart_data
@@ -183,21 +180,36 @@ def fetch_consumption():
 # HOME ASSISTANT PUSH
 # --------------------------------------------------
 
+def wait_for_ws_message(ws, expected_id):
+    """Helper to safely ignore background HA state changes and wait for a specific response."""
+    while True:
+        try:
+            message = ws.recv()
+            data = json.loads(message)
+            if data.get("id") == expected_id:
+                return data
+        except json.JSONDecodeError:
+            continue
+
 def send_to_ha(data):
 
     if not HA_URL or not HA_TOKEN:
         logging.error("HA credentials missing.")
-        return
+        return False
 
     with connect(HA_URL) as ws:
-
-        ws.recv()
+        # 1. Authenticate
+        ws.recv() # Read initial auth required message
         ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
-        if json.loads(ws.recv()).get("type") != "auth_ok":
+        
+        auth_response = json.loads(ws.recv())
+        if auth_response.get("type") != "auth_ok":
             logging.error("HA authentication failed.")
-            return
+            return False
 
-        start_time = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        # 2. Fetch History Lookback
+        # Extended to 60 days to prevent running_sum reset if the scraper was offline for a while
+        start_time = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
 
         ws.send(json.dumps({
             "id": 1,
@@ -207,7 +219,9 @@ def send_to_ha(data):
             "period": "hour"
         }))
 
-        history = json.loads(ws.recv()).get("result", {}).get(STATISTIC_ID, [])
+        # Safely wait for ID 1
+        history_response = wait_for_ws_message(ws, 1)
+        history = history_response.get("result", {}).get(STATISTIC_ID, [])
 
         running_sum = 0
         last_date = ""
@@ -226,6 +240,7 @@ def send_to_ha(data):
             logging.info(f"{data['date']} already imported — skipping.")
             return True
 
+        # 3. Prepare new stats
         stats = []
         helsinki = tz.gettz("Europe/Helsinki")
         base_time = datetime.strptime(data["date"], "%Y-%m-%d").replace(tzinfo=helsinki)
@@ -238,6 +253,7 @@ def send_to_ha(data):
                 "sum": round(running_sum, 3)
             })
 
+        # 4. Push stats to HA
         ws.send(json.dumps({
             "id": 2,
             "type": "recorder/import_statistics",
@@ -252,31 +268,44 @@ def send_to_ha(data):
             "stats": stats
         }))
 
-        result = json.loads(ws.recv())
-        if result.get("success"):
+        # Safely wait for ID 2
+        import_response = wait_for_ws_message(ws, 2)
+        if import_response.get("success"):
             logging.info("Successfully injected into Home Assistant.")
             return True
+        else:
+            logging.error(f"Failed to inject data into HA: {import_response}")
 
         return False
 
 # --------------------------------------------------
-# JOB WITH HOURLY RETRY
+# JOB WITH CONDITIONAL RETRY
 # --------------------------------------------------
 
 def job():
+    logging.info("Starting scraper job...")
     try:
         data = fetch_consumption()
 
-        if not data:
-            return
+        if data:
+            success = send_to_ha(data)
 
-        success = send_to_ha(data)
-
-        if success:
-            logging.info("Import completed. Waiting until next day.")
+            if success:
+                logging.info("Import completed successfully. Waiting until next scheduled daily run.")
+                # Success! Clear any active hourly retry jobs so it stops retrying.
+                schedule.clear('retry')
+                return
+        else:
+            logging.info("Data not fully measured yet.")
 
     except Exception as e:
-        logging.error(f"Job failed: {e}")
+        logging.error(f"Job encountered an error: {e}")
+
+    # If we reach this point, the data was None, HA push failed, or an exception occurred.
+    # Check if a retry job is already scheduled. If not, create one.
+    if not schedule.get_jobs('retry'):
+        logging.info("Scheduling a retry to run in 1 hour.")
+        schedule.every(1).hours.do(job).tag('retry')
 
 # --------------------------------------------------
 # MAIN LOOP
@@ -288,9 +317,6 @@ if __name__ == "__main__":
         logging.error("Missing Tampere Energia credentials.")
         exit(1)
 
-    # Run immediately on start
-    job()
-
     # Clean and normalize RUN_TIME
     try:
         raw_time = RUN_TIME.strip().replace('"', '')
@@ -300,14 +326,14 @@ if __name__ == "__main__":
         logging.warning("Invalid RUN_TIME format. Falling back to 06:15")
         RUN_TIME_CLEAN = "06:15"
 
-    # Daily safety trigger
-    schedule.every().day.at(RUN_TIME_CLEAN).do(job)
+    # 1. Setup the permanent daily trigger
+    schedule.every().day.at(RUN_TIME_CLEAN).do(job).tag('daily')
+    logging.info(f"Scheduler started. Daily run time set to {RUN_TIME_CLEAN}.")
 
-    # Hourly retry until measured
-    schedule.every().hour.do(job)
+    # 2. Run immediately on container start
+    job()
 
-    logging.info("Scheduler started (hourly retry + daily trigger).")
-
+    # 3. Keep the script alive and check the schedule
     while True:
         schedule.run_pending()
         time.sleep(60)
