@@ -1,19 +1,38 @@
+"""Tampereen Energia (omanrg) -> Home Assistant hourly consumption importer.
+
+Tampereen Energia moved to asiakas.omanrg.fi / mittaus.omanrg.fi in Nov 2026.
+The new flow needs no browser:
+
+  1. POST api.asiakas.omanrg.fi/api/auth/login/credentials-authentication
+  2. POST /api/auth/access/token/<userId>/v2  (sets `applications_token` cookie)
+  3. GET  public.mittaus.omanrg.fi/api/gen/customer_data_with_token
+         (Bearer applications_token)  -> short lived data token
+  4. GET  public.mittaus.omanrg.fi/api/gen/meter_reading_yh
+         (Bearer data token) -> hourly values for a whole year, in Wh
+
+Everything newer than the last statistic in Home Assistant is imported, but
+only whole local days (so a half-measured day is picked up on a later run).
+"""
+
 import os
+import sys
 import json
 import time
 import logging
+import argparse
 import schedule
+import requests
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from dateutil import tz
+from zoneinfo import ZoneInfo
 
-from playwright.sync_api import sync_playwright
 from websockets.sync.client import connect
 
 # --------------------------------------------------
 # LOGGING
 # --------------------------------------------------
 
-DATA_DIR = "/app/data"
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -21,11 +40,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(os.path.join(DATA_DIR, "scraper.log")),
-        logging.StreamHandler()
+        logging.StreamHandler(),
     ],
 )
-
-logging.info("=== Tampere Energia Scraper Started ===")
 
 # --------------------------------------------------
 # ENV
@@ -33,229 +50,232 @@ logging.info("=== Tampere Energia Scraper Started ===")
 
 USERNAME = os.getenv("TE_USERNAME")
 PASSWORD = os.getenv("TE_PASSWORD")
-METERINGPOINT = os.getenv("TE_METERINGPOINT", "")
+# Optional: GSRN of the metering point (18 digits). Auto-discovered if empty.
+GSRN_OVERRIDE = (os.getenv("TE_METERINGPOINT") or "").strip().strip('"')
 HA_URL = os.getenv("HA_URL")
 HA_TOKEN = os.getenv("HA_TOKEN")
 RUN_TIME = os.getenv("RUN_TIME", "06:15").replace('"', "")
 
 STATISTIC_ID = "tampereen_energia:imported_history"
+HELSINKI = ZoneInfo("Europe/Helsinki")
+
+API = "https://api.asiakas.omanrg.fi"
+MITTAUS = "https://public.mittaus.omanrg.fi/api/gen"
+TIMEOUT = 60
 
 # --------------------------------------------------
-# FETCH CONSUMPTION (MEASURED ONLY)
+# OMANRG CLIENT
 # --------------------------------------------------
 
-def fetch_consumption():
 
-    target_date = datetime.now(timezone.utc) - timedelta(days=2)
-    date_str = target_date.strftime("%Y-%m-%d")
+def omanrg_login():
+    """Log in and return (session, userId, applications_token)."""
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0 (tampere_energy importer)"
 
-    logging.info(f"Fetching data for {date_str}")
+    r = s.post(
+        f"{API}/api/auth/login/credentials-authentication",
+        json={"email": USERNAME, "password": PASSWORD},
+        timeout=TIMEOUT,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Login failed with status {r.status_code}")
 
-    with sync_playwright() as p:
+    csrf = {"X-CSRF-Token": s.cookies.get("csrf_token") or ""}
 
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 800})
-        page = context.new_page()
+    r = s.get(f"{API}/api/customerships", timeout=TIMEOUT)
+    r.raise_for_status()
+    user = r.json()["data"]["user"]
+    user_id = user["userId"]
 
-        api_info = {"payload": None, "url": "", "headers": {}}
+    r = s.post(f"{API}/api/auth/access/token/{user_id}/v2", json={}, headers=csrf, timeout=TIMEOUT)
+    r.raise_for_status()
+    apps_token = next((c.value for c in s.cookies if c.name == "applications_token"), None)
+    if not apps_token:
+        raise RuntimeError("applications_token cookie missing after token request")
 
-        def intercept(route):
-            if "DataActionGetData" in route.request.url and not api_info["payload"]:
-                try:
-                    payload = route.request.post_data_json
-                    variables = payload.get("screenData", {}).get("variables", {})
-                    if "FilterParameters" in variables:
-                        api_info["payload"] = payload
-                        api_info["url"] = route.request.url
-                        api_info["headers"] = {
-                            k: v for k, v in route.request.headers.items()
-                            if k.lower() != "content-length"
-                        }
-                        logging.info("Captured API template.")
-                except Exception as e:
-                    pass
-            route.continue_()
+    return user, apps_token
 
-        page.route("**/DataActionGetData*", intercept)
 
-        # LOGIN
-        page.goto("https://kirjautuminen.tampereenenergia.fi/login")
-
-        try:
-            page.click("button:has-text('Hyväksy')", timeout=3000)
-        except:
-            pass
-
-        page.fill("input[name='username']", USERNAME, force=True)
-        page.fill("input[name='password']", PASSWORD, force=True)
-        page.click("button[type='submit']")
-
-        try:
-            service_button = page.get_by_role("button", name="Siirry palveluun").first
-            service_button.wait_for(state="visible", timeout=15000)
-            service_button.click()
-        except:
-            pass
-
-        page.wait_for_url("**/Home**", timeout=30000)
-
-        page.goto(
-            "https://app.tampereenenergia.fi/PowerPlantDistributionPWA/Consumption",
-            wait_until="networkidle" # Let the SPA load completely
-        )
-
-        try:
-            page.wait_for_selector(
-                ".ppt_consumption_container, .chart-container",
-                timeout=15000
+def pick_metering_point(user):
+    """Return (gsrn, customer_number) for the consumption metering point."""
+    candidates = []
+    for cust in user.get("customerData", []):
+        for c in cust.get("meteringPointContracts", []):
+            if c.get("meteringPointType") not in (None, "kulutus"):
+                continue
+            candidates.append(
+                (c["gsrn"], c.get("customerNumber") or cust["customerNumber"], c.get("end") is None)
             )
-        except:
-            logging.warning("Chart container not detected.")
+    if GSRN_OVERRIDE:
+        candidates = [c for c in candidates if c[0] == GSRN_OVERRIDE] or candidates
+    if not candidates:
+        raise RuntimeError("No consumption metering points found for this user.")
+    # Prefer one with an open (current) contract
+    candidates.sort(key=lambda c: not c[2])
+    return candidates[0][0], candidates[0][1]
 
-        # Replaced the manual time.sleep loop with a proper wait for network idle
-        try:
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except:
-            logging.warning("Network did not reach idle state within timeout, proceeding anyway.")
 
-        if not api_info["payload"]:
-            browser.close()
-            raise RuntimeError("Failed to capture API template. The interceptor didn't catch the request.")
+def fetch_hourly(years):
+    """Return {utc_datetime: kWh} for the given years, hourly."""
+    user, apps_token = omanrg_login()
+    gsrn, customer = pick_metering_point(user)
+    logging.info(f"Metering point {gsrn}, customer {customer}")
 
-        start_str = target_date.strftime('%Y-%m-%dT00:00:00.000Z')
-        end_str = target_date.strftime('%Y-%m-%dT23:59:59.000Z')
+    r = requests.get(
+        f"{MITTAUS}/customer_data_with_token",
+        headers={"authorization": f"Bearer {apps_token}"},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    data_token = r.json()["token"]
 
-        payload = api_info["payload"]
-        variables = payload["screenData"]["variables"]
-        filter_params = variables["FilterParameters"]
-
-        filter_params["StartDate"] = start_str
-        filter_params["EndDate"] = end_str
-        filter_params["PeriodId"] = 9
-        variables["IsHistoricaDataFetched"] = True
-
-        if METERINGPOINT:
-            filter_params["MeteringPointId"] = METERINGPOINT
-
-        response = page.request.post(
-            api_info["url"],
-            data=payload,
-            headers=api_info["headers"]
+    values = {}
+    for year in years:
+        r = requests.get(
+            f"{MITTAUS}/meter_reading_yh",
+            params={"gsrn": gsrn, "customer_ids": customer, "year": year, "timestep": "PT1H"},
+            headers={"authorization": f"Bearer {data_token}"},
+            timeout=TIMEOUT,
         )
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        for month in r.json().get("months", []):
+            for row in month.get("hourly_values", []):
+                if row.get("v") is None:
+                    continue
+                t = datetime.fromisoformat(row["t"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                values[t] = round(float(row["v"]) / 1000.0, 3)  # Wh -> kWh
+    logging.info(f"Fetched {len(values)} hourly values")
+    return values
 
-        if not response.ok:
-            browser.close()
-            raise RuntimeError(f"Consumption API request failed with status {response.status}")
 
-        resp_json = response.json()
-        browser.close()
+def complete_days(values):
+    """Group hourly values by local day; keep only days with every hour present.
 
-        dataset = resp_json.get("data", {}).get("Dataset", {})
-        chart_data = dataset.get("ChartData", {}).get("List", [])
+    Returns a sorted list of (utc_start, kWh) for all hours of complete days.
+    """
+    by_day = defaultdict(dict)
+    for t, v in values.items():
+        by_day[t.astimezone(HELSINKI).date()][t] = v
 
-        if not chart_data:
-            raise RuntimeError("No chart data found in the API response.")
+    out = []
+    for day, hours in sorted(by_day.items()):
+        start = datetime(day.year, day.month, day.day, tzinfo=HELSINKI).astimezone(timezone.utc)
+        nxt = day + timedelta(days=1)
+        end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=HELSINKI).astimezone(timezone.utc)
+        expected = int((end - start).total_seconds() // 3600)  # 23/24/25 on DST days
+        if len(hours) == expected:
+            out.extend(sorted(hours.items()))
+        else:
+            logging.info(f"{day}: only {len(hours)}/{expected} hours measured so far, skipping")
+    return out
 
-        measured_rows = [
-            row for row in chart_data
-            if row.get("StatusDescriptionName") == "Mitattu"
-        ]
-
-        if len(measured_rows) != 24:
-            logging.info(
-                f"Not fully measured yet ({len(measured_rows)}/24 hours)."
-            )
-            return None
-
-        hourly_values = [float(row["Consumption"]) for row in measured_rows]
-
-        logging.info("Day fully measured ✔")
-
-        return {
-            "hourly_data": hourly_values,
-            "date": date_str
-        }
 
 # --------------------------------------------------
-# HOME ASSISTANT PUSH
+# HOME ASSISTANT
 # --------------------------------------------------
+
 
 def wait_for_ws_message(ws, expected_id):
-    """Helper to safely ignore background HA state changes and wait for a specific response."""
+    """Ignore background HA messages and wait for a specific response."""
     while True:
         try:
-            message = ws.recv()
-            data = json.loads(message)
-            if data.get("id") == expected_id:
-                return data
+            data = json.loads(ws.recv())
         except json.JSONDecodeError:
             continue
+        if data.get("id") == expected_id:
+            return data
 
-def send_to_ha(data):
 
+def stat_start_to_dt(start):
+    """HA returns `start` as epoch milliseconds (or ISO string on newer cores)."""
+    if isinstance(start, (int, float)):
+        return datetime.fromtimestamp(start / 1000, tz=timezone.utc)
+    return datetime.fromisoformat(str(start).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def ha_last_statistic(ws):
+    """Return (last_start_utc or None, running_sum)."""
+    start_time = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    ws.send(json.dumps({
+        "id": 1,
+        "type": "recorder/statistics_during_period",
+        "start_time": start_time,
+        "statistic_ids": [STATISTIC_ID],
+        "period": "hour",
+    }))
+    history = wait_for_ws_message(ws, 1).get("result", {}).get(STATISTIC_ID, [])
+
+    if history:
+        last = history[-1]
+        return stat_start_to_dt(last["start"]), float(last.get("sum") or 0)
+
+    # Nothing within 60 days: only start from 0 if the statistic never existed,
+    # otherwise we would reset the running sum.
+    ws.send(json.dumps({
+        "id": 2,
+        "type": "recorder/get_statistics_metadata",
+        "statistic_ids": [STATISTIC_ID],
+    }))
+    meta = wait_for_ws_message(ws, 2).get("result") or []
+    if meta:
+        raise RuntimeError(
+            "Statistic exists in HA but has no data in the last 60 days; "
+            "refusing to restart the running sum from 0."
+        )
+    return None, 0.0
+
+
+def ha_authenticate(ws):
+    ws.recv()  # auth_required
+    ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+    if json.loads(ws.recv()).get("type") != "auth_ok":
+        raise RuntimeError("HA authentication failed.")
+
+
+def sync(dry_run=False):
+    """Fetch new complete days from omanrg and import them into HA.
+
+    Returns the number of hours imported.
+    """
     if not HA_URL or not HA_TOKEN:
-        logging.error("HA credentials missing.")
-        return False
+        raise RuntimeError("HA credentials missing.")
 
     with connect(HA_URL) as ws:
-        # 1. Authenticate
-        ws.recv() # Read initial auth required message
-        ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
-        
-        auth_response = json.loads(ws.recv())
-        if auth_response.get("type") != "auth_ok":
-            logging.error("HA authentication failed.")
-            return False
+        ha_authenticate(ws)
+        last_start, running_sum = ha_last_statistic(ws)
+        logging.info(
+            "HA last statistic: "
+            + (f"{last_start.astimezone(HELSINKI):%Y-%m-%d %H:%M}, sum={running_sum:.3f}" if last_start else "none")
+        )
 
-        # 2. Fetch History Lookback
-        # Extended to 60 days to prevent running_sum reset if the scraper was offline for a while
-        start_time = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        first_year = (last_start or datetime.now(timezone.utc) - timedelta(days=365)).astimezone(HELSINKI).year
+        years = range(first_year, datetime.now(HELSINKI).year + 1)
+        values = fetch_hourly(years)
 
-        ws.send(json.dumps({
-            "id": 1,
-            "type": "recorder/statistics_during_period",
-            "start_time": start_time,
-            "statistic_ids": [STATISTIC_ID],
-            "period": "hour"
-        }))
+        new = [(t, v) for t, v in complete_days(values) if last_start is None or t > last_start]
+        if not new:
+            logging.info("No new complete days to import.")
+            return 0
 
-        # Safely wait for ID 1
-        history_response = wait_for_ws_message(ws, 1)
-        history = history_response.get("result", {}).get(STATISTIC_ID, [])
-
-        running_sum = 0
-        last_date = ""
-
-        if history:
-            last_stat = history[-1]
-            running_sum = last_stat.get("sum", 0)
-
-            last_start = last_stat.get("start", 0)
-            if last_start:
-                dt = datetime.fromtimestamp(last_start / 1000, tz=timezone.utc)
-                dt = dt.astimezone(tz.gettz("Europe/Helsinki"))
-                last_date = dt.strftime("%Y-%m-%d")
-
-        if data["date"] == last_date:
-            logging.info(f"{data['date']} already imported — skipping.")
-            return True
-
-        # 3. Prepare new stats
         stats = []
-        helsinki = tz.gettz("Europe/Helsinki")
-        base_time = datetime.strptime(data["date"], "%Y-%m-%d").replace(tzinfo=helsinki)
+        for t, v in new:
+            running_sum += v
+            stats.append({"start": t.isoformat(), "state": v, "sum": round(running_sum, 3)})
 
-        for i, value in enumerate(data["hourly_data"]):
-            running_sum += float(value)
-            stats.append({
-                "start": (base_time + timedelta(hours=i)).isoformat(),
-                "state": float(value),
-                "sum": round(running_sum, 3)
-            })
+        first, last = new[0][0].astimezone(HELSINKI), new[-1][0].astimezone(HELSINKI)
+        logging.info(
+            f"Importing {len(stats)} hours ({first:%Y-%m-%d %H:%M} .. {last:%Y-%m-%d %H:%M}), "
+            f"{sum(v for _, v in new):.3f} kWh, new sum {running_sum:.3f}"
+        )
+        if dry_run:
+            logging.info("Dry run: nothing sent to HA.")
+            return len(stats)
 
-        # 4. Push stats to HA
         ws.send(json.dumps({
-            "id": 2,
+            "id": 3,
             "type": "recorder/import_statistics",
             "metadata": {
                 "has_mean": False,
@@ -263,77 +283,75 @@ def send_to_ha(data):
                 "name": "Tampereen Energia",
                 "source": "tampereen_energia",
                 "statistic_id": STATISTIC_ID,
-                "unit_of_measurement": "kWh"
+                "unit_of_measurement": "kWh",
             },
-            "stats": stats
+            "stats": stats,
         }))
+        resp = wait_for_ws_message(ws, 3)
+        if not resp.get("success"):
+            raise RuntimeError(f"Failed to inject data into HA: {resp}")
+        logging.info("Successfully injected into Home Assistant.")
+        return len(stats)
 
-        # Safely wait for ID 2
-        import_response = wait_for_ws_message(ws, 2)
-        if import_response.get("success"):
-            logging.info("Successfully injected into Home Assistant.")
-            return True
-        else:
-            logging.error(f"Failed to inject data into HA: {import_response}")
-
-        return False
 
 # --------------------------------------------------
 # JOB WITH CONDITIONAL RETRY
 # --------------------------------------------------
 
+
 def job():
-    logging.info("Starting scraper job...")
+    logging.info("Starting import job...")
     try:
-        data = fetch_consumption()
-
-        if data:
-            success = send_to_ha(data)
-
-            if success:
-                logging.info("Import completed successfully. Waiting until next scheduled daily run.")
-                # Success! Clear any active hourly retry jobs so it stops retrying.
-                schedule.clear('retry')
-                return
-        else:
-            logging.info("Data not fully measured yet.")
-
+        imported = sync()
+        if imported:
+            schedule.clear("retry")
+            logging.info("Import completed. Waiting until next scheduled daily run.")
+            return
+        logging.info("Nothing new yet.")
     except Exception as e:
         logging.error(f"Job encountered an error: {e}")
 
-    # If we reach this point, the data was None, HA push failed, or an exception occurred.
-    # Check if a retry job is already scheduled. If not, create one.
-    if not schedule.get_jobs('retry'):
+    if not schedule.get_jobs("retry"):
         logging.info("Scheduling a retry to run in 1 hour.")
-        schedule.every(1).hours.do(job).tag('retry')
+        schedule.every(1).hours.do(job).tag("retry")
+
 
 # --------------------------------------------------
-# MAIN LOOP
+# MAIN
 # --------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="run one import and exit")
+    parser.add_argument("--dry-run", action="store_true", help="with --once: do not write to HA")
+    args = parser.parse_args()
+
+    logging.info("=== Tampere Energia (omanrg) importer started ===")
 
     if not USERNAME or not PASSWORD:
         logging.error("Missing Tampere Energia credentials.")
-        exit(1)
+        sys.exit(1)
 
-    # Clean and normalize RUN_TIME
+    if args.once:
+        try:
+            sync(dry_run=args.dry_run)
+        except Exception as e:
+            logging.error(f"Error: {e}")
+            sys.exit(1)
+        sys.exit(0)
+
     try:
-        raw_time = RUN_TIME.strip().replace('"', '')
-        h, m = raw_time.split(":")
-        RUN_TIME_CLEAN = f"{int(h):02d}:{int(m):02d}"
+        h, m = RUN_TIME.strip().split(":")
+        run_time = f"{int(h):02d}:{int(m):02d}"
     except Exception:
         logging.warning("Invalid RUN_TIME format. Falling back to 06:15")
-        RUN_TIME_CLEAN = "06:15"
+        run_time = "06:15"
 
-    # 1. Setup the permanent daily trigger
-    schedule.every().day.at(RUN_TIME_CLEAN).do(job).tag('daily')
-    logging.info(f"Scheduler started. Daily run time set to {RUN_TIME_CLEAN}.")
+    schedule.every().day.at(run_time).do(job).tag("daily")
+    logging.info(f"Scheduler started. Daily run time set to {run_time}.")
 
-    # 2. Run immediately on container start
-    job()
+    job()  # run immediately on container start
 
-    # 3. Keep the script alive and check the schedule
     while True:
         schedule.run_pending()
         time.sleep(60)

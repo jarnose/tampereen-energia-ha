@@ -6,11 +6,10 @@ services:
     env_file:
      - .env
 
-    # Map the host's log folder to the container
     volumes:
       - ./data:/app/data
-      - /etc/localtime:/etc/localtime:ro  # <--- Forces container to match host clock
-      - /etc/timezone:/etc/timezone:ro    # <--- Forces container to match host timezone
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
 
     # Prevent Docker system logs from growing infinitely
     logging:
@@ -20,7 +19,7 @@ services:
         max-file: "3"
 
     environment:
-      # Timezone ensures the schedule runs at 08:15 Finnish time, not UTC
       - PYTHONUNBUFFERED=1
+      # Timezone makes RUN_TIME be interpreted as Finnish time, not UTC
       - TZ=Europe/Helsinki
-      - RUN_TIME=08:15
+      - RUN_TIME=06:15

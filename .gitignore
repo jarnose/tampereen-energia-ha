@@ -1,6 +1,8 @@
+# Secrets
 .env
+
+# Runtime data (logs, caches) mapped into the container
+data/
+
 __pycache__/
 *.pyc
-import_state.json
-retry_state.json
-history.json
