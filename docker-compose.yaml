@@ -3,6 +3,13 @@ services:
     build: .
     container_name: tampere_energy
     restart: unless-stopped
+
+    # Explicit DNS: after a host reboot Docker may start this container before
+    # the host has working DNS and then keeps an empty resolver for its lifetime
+    # ("Temporary failure in name resolution"). Replace with your LAN DNS if you like.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     env_file:
      - .env
 

@@ -88,6 +88,13 @@ Nothing extra is needed for the history. On the first run, when the statistic do
 
 ---
 
+## Troubleshooting
+
+* **`Temporary failure in name resolution` in the log, but the host has internet:** the container was probably started during boot before DNS was ready, and Docker keeps an empty resolver for its lifetime. Recreate it with `docker compose up -d --force-recreate`. The `dns:` setting in `docker-compose.yaml` prevents this from recurring.
+* **Nothing new is imported:** the portal publishes readings with about a day's delay; the script only imports complete days and retries every hour.
+
+---
+
 ## Viewing data in Home Assistant
 
 The data is stored under the statistic ID `tampereen_energia:imported_history`.
